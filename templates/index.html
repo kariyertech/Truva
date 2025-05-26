@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Pod Logs</title>
+    <script>
+        function openWebSocket(podName) {
+            const socket = new WebSocket("ws://localhost:8080/ws");
+
+            socket.onmessage = function(event) {
+                const logContainer = document.getElementById("logs");
+                logContainer.innerHTML += `<p>${event.data}</p>`;
+            };
+
+            socket.onopen = function(event) {
+                console.log(`WebSocket opened for ${podName}`);
+            };
+
+            socket.onclose = function(event) {
+                console.log("WebSocket closed");
+            };
+        }
+    </script>
+</head>
+<body>
+    <h1>Pod Logs</h1>
+    <div>
+        <h3>Pods:</h3>
+        {{range .}}
+        <button onclick="openWebSocket('{{.}}')">{{.}}</button>
+        {{end}}
+    </div>
+    <div id="logs" style="border: 1px solid black; padding: 10px; margin-top: 20px; height: 300px; overflow-y: scroll;">
+        <h3>Logs:</h3>
+    </div>
+</body>
+</html>

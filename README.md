@@ -1,20 +1,35 @@
-# Introduction 
-TODO: Give a short introduction of your project. Let this section explain the objectives or the motivation behind this project. 
+# Truva
 
-# Getting Started
-TODO: Guide users through getting your code up and running on their own system. In this section you can talk about:
-1.	Installation process
-2.	Software dependencies
-3.	Latest releases
-4.	API references
+Truva is a CLI tool designed for managing Kubernetes deployments and pods, with a built-in UI for monitoring logs in real time. The tool enables syncing files from the local machine to Kubernetes pods, restarting processes, and displaying logs of all pods dynamically in a web interface.
 
-# Build and Test
-TODO: Describe and show how to build your code and run the tests. 
+## Features
 
-# Contribute
-TODO: Explain how other users and developers can contribute to make your code better. 
+- **File Sync**: Sync local files to the target Kubernetes deployment or pod.
+- **Process Restart**: Automatically restart processes in Kubernetes pods after file synchronization.
+- **Dynamic Log Monitoring**: Monitor logs of each pod in real time through a web-based interface.
+- **WebSocket Integration**: Logs are streamed in real time using WebSocket connections.
+- **Multiple Pods Support**: Supports deployments with multiple pods, dynamically creating buttons to monitor each pod individually.
 
-If you want to learn more about creating good readme files then refer the following [guidelines](https://docs.microsoft.com/en-us/azure/devops/repos/git/create-a-readme?view=azure-devops). You can also seek inspiration from the below readme files:
-- [ASP.NET Core](https://github.com/aspnet/Home)
-- [Visual Studio Code](https://github.com/Microsoft/vscode)
-- [Chakra Core](https://github.com/Microsoft/ChakraCore)
+### Key Components:
+
+- `cmd`: Contains the main application logic and the CLI commands.
+- `internal/k8s`: Handles Kubernetes-related operations like backing up, modifying, and restoring deployments.
+- `internal/sync`: Responsible for syncing files to the Kubernetes pods and restarting processes.
+- `internal/ui`: Manages the web server and WebSocket logic for real-time log streaming.
+- `pkg/api`: API routes for syncing and log management.
+- `pkg/utils`: Utility functions such as file watching and logging.
+- `templates/index.html`: The HTML file that powers the web interface for displaying pod logs.
+
+## Getting Started
+
+### Prerequisites
+
+- Kubernetes cluster access
+- `kubectl` command-line tool installed and configured
+- YQ and JQ Tools
+
+## Example Usage
+
+```bash
+go run main.go up --namespace <namespace> --targetType deployment --targetName <deployment-name> --localPath <path-to-local-files> --containerPath <container-path-in-pod>
+```
