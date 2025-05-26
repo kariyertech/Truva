@@ -1,3 +1,5 @@
+[Türkçe](./README.tr.md) | [English](./README.md)
+
 # Truva
 
 Truva is a CLI tool designed for managing Kubernetes deployments and pods, with a built-in UI for monitoring logs in real time. The tool enables syncing files from the local machine to Kubernetes pods, restarting processes, and displaying logs of all pods dynamically in a web interface.
