@@ -1,0 +1,23 @@
+# Truva Configuration File
+server:
+  port: 8080
+  host: "localhost"
+  
+logging:
+  level: "info"
+  file: "app.log"
+  format: "json"
+  
+kubernetes:
+  config_path: "~/.kube/config"
+  
+ui:
+  template_path: "templates/index.html"
+  
+sync:
+  debounce_duration: "2s"
+  batch_size: 10
+  
+monitoring:
+  metrics_enabled: false
+  health_check_enabled: true

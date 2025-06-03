@@ -1,0 +1,377 @@
+openapi: 3.0.3
+info:
+  title: Truva - Kubernetes Development Tool API
+  description: |
+    Truva is a Kubernetes development tool that provides real-time file synchronization,
+    log streaming, and deployment management capabilities.
+  version: 1.0.0
+  contact:
+    name: Truva Team
+    url: https://github.com/kariyertech/Truva
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: https://truva.example.com
+    description: Production server
+
+paths:
+  /api/sync:
+    post:
+      summary: Synchronize files with Kubernetes deployment
+      description: |
+        Modifies a Kubernetes deployment to enable file synchronization between
+        local development environment and running pods.
+      tags:
+        - Synchronization
+      parameters:
+        - name: namespace
+          in: query
+          required: true
+          description: Kubernetes namespace containing the deployment
+          schema:
+            type: string
+            example: default
+        - name: deployment
+          in: query
+          required: true
+          description: Name of the Kubernetes deployment to modify
+          schema:
+            type: string
+            example: my-app
+        - name: local-path
+          in: query
+          required: true
+          description: Local file system path to synchronize
+          schema:
+            type: string
+            example: /path/to/local/code
+        - name: container-path
+          in: query
+          required: true
+          description: Container path where files should be synchronized
+          schema:
+            type: string
+            example: /app
+      responses:
+        '200':
+          description: Deployment modified successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Deployment modified successfully
+        '400':
+          description: Missing required query parameters
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: Missing required query parameters
+        '500':
+          description: Failed to modify deployment
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Failed to modify deployment: error details"
+
+  /api/logs:
+    post:
+      summary: Submit application logs
+      description: |
+        Accepts log data from applications and writes it to the application log file.
+      tags:
+        - Logging
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              example: "2024-12-19 10:30:00 INFO Application started successfully"
+          application/json:
+            schema:
+              type: object
+              properties:
+                timestamp:
+                  type: string
+                  format: date-time
+                level:
+                  type: string
+                  enum: [DEBUG, INFO, WARN, ERROR]
+                message:
+                  type: string
+                source:
+                  type: string
+      responses:
+        '204':
+          description: Logs written successfully
+        '500':
+          description: Failed to write logs
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: Failed to write logs
+
+  /health:
+    get:
+      summary: Get application health status
+      description: |
+        Returns the overall health status of the application including uptime,
+        version information, and various health checks.
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Application is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: Health check disabled or application unhealthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: Health check disabled
+
+  /health/ready:
+    get:
+      summary: Get application readiness status
+      description: |
+        Returns whether the application is ready to serve traffic.
+        Used by Kubernetes readiness probes.
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Application is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: Application is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/live:
+    get:
+      summary: Get application liveness status
+      description: |
+        Returns whether the application is alive and functioning.
+        Used by Kubernetes liveness probes.
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Application is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: Application is not alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /ws:
+    get:
+      summary: WebSocket connection for real-time logs
+      description: |
+        Establishes a WebSocket connection for real-time log streaming from
+        Kubernetes pods. Supports filtering by pod and log level.
+      tags:
+        - WebSocket
+      parameters:
+        - name: Upgrade
+          in: header
+          required: true
+          schema:
+            type: string
+            enum: [websocket]
+        - name: Connection
+          in: header
+          required: true
+          schema:
+            type: string
+            enum: [Upgrade]
+        - name: Sec-WebSocket-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Sec-WebSocket-Version
+          in: header
+          required: true
+          schema:
+            type: string
+            enum: ["13"]
+      responses:
+        '101':
+          description: WebSocket connection established
+        '400':
+          description: Bad request - invalid WebSocket headers
+        '500':
+          description: Internal server error
+
+  /ws/status:
+    get:
+      summary: Get WebSocket connection status
+      description: |
+        Returns information about active WebSocket connections and their status.
+      tags:
+        - WebSocket
+      responses:
+        '200':
+          description: WebSocket status information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active_connections:
+                    type: integer
+                    description: Number of active WebSocket connections
+                    example: 3
+                  total_connections:
+                    type: integer
+                    description: Total connections since server start
+                    example: 15
+                  uptime:
+                    type: string
+                    description: Server uptime
+                    example: "2h30m45s"
+
+  /:
+    get:
+      summary: Serve web interface
+      description: |
+        Serves the main web interface for Truva, providing a user-friendly
+        dashboard for monitoring logs and managing synchronization.
+      tags:
+        - Web Interface
+      responses:
+        '200':
+          description: Web interface HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+        '500':
+          description: Failed to load template
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, unhealthy, degraded]
+          description: Overall health status
+          example: healthy
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp when health check was performed
+          example: "2024-12-19T10:30:00Z"
+        version:
+          type: string
+          description: Application version
+          example: "1.0.0"
+        uptime:
+          type: string
+          description: Application uptime
+          example: "2h30m45s"
+        checks:
+          type: object
+          description: Individual health check results
+          additionalProperties:
+            $ref: '#/components/schemas/Check'
+          example:
+            config:
+              status: ok
+              message: Configuration loaded successfully
+            kubernetes:
+              status: ok
+              message: Kubernetes API accessible
+
+    Check:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, warning, error]
+          description: Status of the individual check
+          example: ok
+        message:
+          type: string
+          description: Optional message providing more details
+          example: Configuration loaded successfully
+
+    LogMessage:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Log message timestamp
+        level:
+          type: string
+          enum: [DEBUG, INFO, WARN, ERROR]
+          description: Log level
+        message:
+          type: string
+          description: Log message content
+        pod:
+          type: string
+          description: Pod name that generated the log
+        container:
+          type: string
+          description: Container name that generated the log
+        namespace:
+          type: string
+          description: Kubernetes namespace
+
+    WebSocketMessage:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [log, status, error, ping, pong]
+          description: Message type
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/LogMessage'
+            - type: object
+              description: Status or error data
+        timestamp:
+          type: string
+          format: date-time
+          description: Message timestamp
+
+tags:
+  - name: Synchronization
+    description: File synchronization operations
+  - name: Logging
+    description: Log management operations
+  - name: Health
+    description: Health check endpoints
+  - name: WebSocket
+    description: Real-time communication via WebSocket
+  - name: Web Interface
+    description: Web-based user interface

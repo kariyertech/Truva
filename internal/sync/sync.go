@@ -1,47 +1,72 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/kariyertech/Truva.git/internal/k8s"
-	"github.com/kariyertech/Truva.git/pkg/utils"
-
 	"github.com/fsnotify/fsnotify"
+	"github.com/kariyertech/Truva.git/internal/k8s"
+	"github.com/kariyertech/Truva.git/pkg/config"
+	"github.com/kariyertech/Truva.git/pkg/utils"
+	"github.com/sirupsen/logrus"
 )
 
+// Global variables for change detection and debouncing
 var (
 	changeBuffer   = make(map[string]bool)
-	changeMutex    = &sync.Mutex{}
+	changeMutex    sync.Mutex
 	changeDetected = make(chan struct{}, 1)
+	// Enhanced debouncing with timer management
+	debounceTimer *time.Timer
+	timerMutex    sync.Mutex
+	// Rate limiting for concurrent pod operations
+	maxConcurrentOps = 5 // Maximum number of concurrent pod operations
+	semaphore        = make(chan struct{}, maxConcurrentOps)
 )
 
-func SyncFilesAndRestartPod(podName, namespace, localPath, containerPath string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
+// SyncFilesAndRestartPod copies files to a specific pod and restarts the dotnet process.
+// This function handles the complete workflow of file synchronization and process restart
+// for a single pod, including proper error handling and logging.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout control
+//   - namespace: Kubernetes namespace containing the pod
+//   - podName: Name of the specific pod to sync
+//   - localPath: Local file system path to copy from
+//   - containerPath: Target path inside the pod's container
+//
+// Returns:
+//   - error: Any error encountered during file copying or process restart
+func SyncFilesAndRestartPod(ctx context.Context, namespace, podName, localPath, containerPath string) error {
 	targetPath := containerPath
 	if isDirectory(localPath) {
 		targetPath = containerPath
 	}
 
-	utils.Logger.Info("Syncing files and restarting process in pod:", podName)
+	utils.InfoWithFields(logrus.Fields{
+		"pod_name": podName,
+		"action":   "sync_and_restart",
+	}, "Syncing files and restarting process in pod")
 
 	err := k8s.CopyToPod(podName, namespace, localPath, targetPath)
 	if err != nil {
-		utils.Logger.Error("Failed to copy files to pod:", podName, err)
-		return
+		utils.Logger.Error("Failed to copy files to pod:", podName, "from", localPath, "error:", err)
+		return err
 	}
 
-	err = k8s.RestartDotnetProcess(podName, namespace, containerPath)
+	err = k8s.RestartDotnetProcess(namespace, podName)
 	if err != nil {
 		utils.Logger.Error("Failed to restart process in pod:", podName, err)
-		return
+		return err
 	}
 
 	utils.Logger.Info("Sync and restart completed successfully for pod:", podName)
+
+	return nil
 }
 
 func isDirectory(path string) bool {
@@ -52,7 +77,20 @@ func isDirectory(path string) bool {
 	return info.IsDir()
 }
 
-func SyncFilesAndRestartAllPods(namespace, deployment, localPath, containerPath string) error {
+// SyncFilesAndRestartAllPods synchronizes files to all pods in a deployment and restarts their processes.
+// This function discovers all pods belonging to a deployment using label selectors and performs
+// concurrent file synchronization and process restart operations.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout control
+//   - namespace: Kubernetes namespace containing the deployment
+//   - deployment: Name of the deployment whose pods should be updated
+//   - localPath: Local file system path to sync from
+//   - containerPath: Target path inside the containers
+//
+// Returns:
+//   - error: Any error encountered during pod discovery or synchronization
+func SyncFilesAndRestartAllPods(ctx context.Context, namespace, deployment, localPath, containerPath string) error {
 	deploymentLabels, err := k8s.GetDeploymentSelector(namespace, deployment)
 	if err != nil {
 		return fmt.Errorf("failed to get deployment selector: %w", err)
@@ -68,17 +106,71 @@ func SyncFilesAndRestartAllPods(namespace, deployment, localPath, containerPath 
 	}
 
 	var wg sync.WaitGroup
+	errorChan := make(chan error, len(podNames))
+
+	utils.Logger.Info(fmt.Sprintf("Starting sync for %d pods with rate limiting (max %d concurrent operations)", len(podNames), maxConcurrentOps))
 
 	for _, podName := range podNames {
 		wg.Add(1)
-		go SyncFilesAndRestartPod(podName, namespace, localPath, containerPath, &wg)
+		go func(pod string) {
+			defer wg.Done()
+
+			// Acquire semaphore for rate limiting
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }() // Release semaphore when done
+			case <-ctx.Done():
+				errorChan <- ctx.Err()
+				return
+			}
+
+			utils.Logger.Info(fmt.Sprintf("Starting sync for pod: %s", pod))
+
+			err := SyncFilesAndRestartPod(ctx, namespace, pod, localPath, containerPath)
+			if err != nil {
+				utils.Logger.Error(fmt.Sprintf("Failed to sync pod %s: %v", pod, err))
+				errorChan <- fmt.Errorf("pod %s: %w", pod, err)
+			} else {
+				utils.Logger.Info(fmt.Sprintf("Successfully synced pod: %s", pod))
+			}
+		}(podName)
 	}
 
 	wg.Wait()
+	close(errorChan)
+
+	// Collect any errors that occurred
+	var errors []error
+	for err := range errorChan {
+		errors = append(errors, err)
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("sync failed for %d pods: %v", len(errors), errors)
+	}
+
 	return nil
 }
 
-func WatchForChanges(localPath, namespace, deployment, containerPath string) {
+// WatchForChanges sets up file system monitoring and implements a debounced file synchronization system.
+// This function creates a file watcher that monitors the local path for changes and automatically
+// synchronizes files to all pods in the deployment when changes are detected. It implements:
+//
+// 1. Recursive directory watching with automatic addition of new directories
+// 2. Debouncing mechanism to batch multiple rapid changes
+// 3. Concurrent processing of file events and synchronization
+// 4. Graceful shutdown on context cancellation
+//
+// The debouncing mechanism prevents excessive synchronization operations when multiple files
+// change rapidly (e.g., during a build process).
+//
+// Parameters:
+//   - ctx: Context for cancellation and shutdown coordination
+//   - localPath: Local directory to monitor for changes
+//   - namespace: Kubernetes namespace containing the target deployment
+//   - deployment: Name of the deployment to sync files to
+//   - containerPath: Target path inside the containers
+func WatchForChanges(ctx context.Context, localPath, namespace, deployment, containerPath string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		utils.Logger.Error("Failed to create file watcher:", err)
@@ -121,26 +213,51 @@ func WatchForChanges(localPath, namespace, deployment, containerPath string) {
 		}
 	}()
 
+	// Enhanced debouncing goroutine with timer-based approach
 	go func() {
-		for {
-			<-changeDetected
+		cfg := config.GetConfig()
+		debounceDuration := cfg.GetDebounceDuration()
 
-			time.Sleep(1 * time.Second)
-
+		// processChanges handles the actual file synchronization
+		processChanges := func() {
 			changeMutex.Lock()
-			changes := make([]string, 0, len(changeBuffer))
-			for path := range changeBuffer {
-				changes = append(changes, path)
-			}
-			changeBuffer = make(map[string]bool)
-			changeMutex.Unlock()
+			if len(changeBuffer) > 0 {
+				changeCount := len(changeBuffer)
+				utils.Logger.Info(fmt.Sprintf("Processing %d file changes...", changeCount))
+				changeBuffer = make(map[string]bool)
+				changeMutex.Unlock()
 
-			if len(changes) > 0 {
-				utils.Logger.Info("Detected file changes:", changes)
-				err := SyncFilesAndRestartAllPods(namespace, deployment, localPath, containerPath)
+				err := SyncFilesAndRestartAllPods(ctx, namespace, deployment, localPath, containerPath)
 				if err != nil {
-					utils.Logger.Error("Failed to sync files and restart processes in all pods:", err)
+					utils.Logger.Error("Failed to sync files and restart pods:", err)
+				} else {
+					utils.Logger.Info("Files synced and pods restarted successfully.")
 				}
+			} else {
+				changeMutex.Unlock()
+			}
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				utils.Logger.Info("File watcher shutting down...")
+				// Cancel any pending timer
+				timerMutex.Lock()
+				if debounceTimer != nil {
+					debounceTimer.Stop()
+				}
+				timerMutex.Unlock()
+				return
+			case <-changeDetected:
+				// Reset or create debounce timer
+				timerMutex.Lock()
+				if debounceTimer != nil {
+					// Reset existing timer to extend the debounce period
+					debounceTimer.Stop()
+				}
+				debounceTimer = time.AfterFunc(debounceDuration, processChanges)
+				timerMutex.Unlock()
 			}
 		}
 	}()
@@ -161,6 +278,19 @@ func WatchForChanges(localPath, namespace, deployment, containerPath string) {
 	select {}
 }
 
+// InitialSyncAndRestart performs an initial synchronization of files to all pods in a deployment.
+// This function is typically called before starting the file watcher to ensure all pods have
+// the latest version of files before monitoring begins. It discovers all pods in the deployment
+// and performs concurrent synchronization operations.
+//
+// Parameters:
+//   - localPath: Local file system path to sync from
+//   - namespace: Kubernetes namespace containing the deployment
+//   - deployment: Name of the deployment whose pods should be updated
+//   - containerPath: Target path inside the containers
+//
+// Returns:
+//   - error: Any error encountered during pod discovery or initial synchronization
 func InitialSyncAndRestart(localPath, namespace, deployment, containerPath string) error {
 	utils.Logger.Info("Starting initial sync and restart for all pods.")
 
@@ -180,7 +310,13 @@ func InitialSyncAndRestart(localPath, namespace, deployment, containerPath strin
 
 	for _, podName := range podNames {
 		wg.Add(1)
-		go SyncFilesAndRestartPod(podName, namespace, localPath, containerPath, &wg)
+		go func(pod string) {
+			defer wg.Done()
+			err := SyncFilesAndRestartPod(context.Background(), namespace, pod, localPath, containerPath)
+			if err != nil {
+				utils.Logger.Error("Failed to sync pod:", pod, err)
+			}
+		}(podName)
 	}
 
 	wg.Wait()

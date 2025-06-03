@@ -2,36 +2,664 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Pod Logs</title>
-    <script>
-        function openWebSocket(podName) {
-            const socket = new WebSocket("ws://localhost:8080/ws");
-
-            socket.onmessage = function(event) {
-                const logContainer = document.getElementById("logs");
-                logContainer.innerHTML += `<p>${event.data}</p>`;
-            };
-
-            socket.onopen = function(event) {
-                console.log(`WebSocket opened for ${podName}`);
-            };
-
-            socket.onclose = function(event) {
-                console.log("WebSocket closed");
-            };
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Truva - Kubernetes Development Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-    </script>
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 300;
+        }
+        
+        .header p {
+            opacity: 0.8;
+            font-size: 1.1em;
+        }
+        
+        .controls {
+            padding: 30px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .control-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .control-group:last-child {
+            margin-bottom: 0;
+        }
+        
+        .control-group label {
+            font-weight: 600;
+            color: #495057;
+            min-width: 100px;
+        }
+        
+        .pod-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .pod-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        .pod-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        .pod-btn.active {
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            box-shadow: 0 4px 15px rgba(40, 167, 69, 0.3);
+        }
+        
+        .search-container {
+            position: relative;
+            flex: 1;
+            max-width: 400px;
+        }
+        
+        .search-input {
+            width: 100%;
+            padding: 12px 45px 12px 15px;
+            border: 2px solid #e9ecef;
+            border-radius: 25px;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+        
+        .search-input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .search-icon {
+            position: absolute;
+            right: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #6c757d;
+        }
+        
+        .filter-controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .filter-select, .filter-input {
+            padding: 8px 12px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s ease;
+        }
+        
+        .filter-select:focus, .filter-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .action-btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-clear {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .btn-clear:hover {
+            background: #5a6268;
+        }
+        
+        .btn-export {
+            background: #28a745;
+            color: white;
+        }
+        
+        .btn-export:hover {
+            background: #218838;
+        }
+        
+        .btn-pause {
+            background: #ffc107;
+            color: #212529;
+        }
+        
+        .btn-pause:hover {
+            background: #e0a800;
+        }
+        
+        .logs-container {
+            height: 600px;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .logs-header {
+            padding: 15px 30px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .logs-stats {
+            font-size: 14px;
+            color: #6c757d;
+        }
+        
+        .logs-content {
+            flex: 1;
+            padding: 20px 30px;
+            overflow-y: auto;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        
+        .log-entry {
+            margin-bottom: 5px;
+            padding: 5px 10px;
+            border-radius: 4px;
+            transition: background-color 0.2s ease;
+        }
+        
+        .log-entry:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .log-entry.highlight {
+            background: rgba(255, 235, 59, 0.2);
+            border-left: 3px solid #ffeb3b;
+        }
+        
+        .log-timestamp {
+            color: #569cd6;
+            margin-right: 10px;
+        }
+        
+        .log-level {
+            margin-right: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        
+        .log-level.error {
+            background: #f44336;
+            color: white;
+        }
+        
+        .log-level.warn {
+            background: #ff9800;
+            color: white;
+        }
+        
+        .log-level.info {
+            background: #2196f3;
+            color: white;
+        }
+        
+        .log-level.debug {
+            background: #9e9e9e;
+            color: white;
+        }
+        
+        .log-pod {
+            color: #4fc3f7;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        
+        .log-message {
+            color: #d4d4d4;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        
+        .status-connected {
+            background: #28a745;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-disconnected {
+            background: #dc3545;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .no-logs {
+            text-align: center;
+            color: #6c757d;
+            padding: 50px;
+            font-style: italic;
+        }
+        
+        @media (max-width: 768px) {
+            .control-group {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .filter-controls {
+                flex-direction: column;
+            }
+            
+            .logs-container {
+                height: 400px;
+            }
+        }
+    </style>
 </head>
 <body>
-    <h1>Pod Logs</h1>
-    <div>
-        <h3>Pods:</h3>
-        {{range .}}
-        <button onclick="openWebSocket('{{.}}')">{{.}}</button>
-        {{end}}
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Truva</h1>
+            <p>Kubernetes Development Tool - Real-time Pod Logs</p>
+        </div>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label>Pods:</label>
+                <div class="pod-buttons">
+                    {{range .}}
+                    <button class="pod-btn" onclick="togglePod('{{.}}')">{{.}}</button>
+                    {{end}}
+                </div>
+            </div>
+            
+            <div class="control-group">
+                <label>Search:</label>
+                <div class="search-container">
+                    <input type="text" id="searchInput" class="search-input" placeholder="Search logs..." oninput="filterLogs()">
+                    <span class="search-icon">🔍</span>
+                </div>
+                
+                <div class="filter-controls">
+                    <select id="logLevel" class="filter-select" onchange="filterLogs()">
+                        <option value="">All Levels</option>
+                        <option value="error">Error</option>
+                        <option value="warn">Warning</option>
+                        <option value="info">Info</option>
+                        <option value="debug">Debug</option>
+                    </select>
+                    
+                    <input type="text" id="podFilter" class="filter-input" placeholder="Filter by pod..." oninput="filterLogs()">
+                    
+                    <input type="datetime-local" id="timeFilter" class="filter-input" onchange="filterLogs()">
+                </div>
+                
+                <div class="action-buttons">
+                    <button class="action-btn btn-clear" onclick="clearLogs()">Clear</button>
+                    <button class="action-btn btn-export" onclick="exportLogs()">Export</button>
+                    <button class="action-btn btn-pause" id="pauseBtn" onclick="togglePause()">Pause</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="logs-container">
+            <div class="logs-header">
+                <div>
+                    <span class="status-indicator" id="statusIndicator"></span>
+                    <span id="connectionStatus">Disconnected</span>
+                </div>
+                <div class="logs-stats">
+                    <span id="logCount">0 logs</span> | 
+                    <span id="filteredCount">0 filtered</span>
+                </div>
+            </div>
+            <div class="logs-content" id="logs">
+                <div class="no-logs">Select a pod to start viewing logs...</div>
+            </div>
+        </div>
     </div>
-    <div id="logs" style="border: 1px solid black; padding: 10px; margin-top: 20px; height: 300px; overflow-y: scroll;">
-        <h3>Logs:</h3>
-    </div>
+
+    <script>
+        let socket = null;
+        let activePods = new Set();
+        let allLogs = [];
+        let filteredLogs = [];
+        let isPaused = false;
+        let logCounter = 0;
+        
+        function togglePod(podName) {
+            const btn = event.target;
+            
+            if (activePods.has(podName)) {
+                activePods.delete(podName);
+                btn.classList.remove('active');
+            } else {
+                activePods.add(podName);
+                btn.classList.add('active');
+            }
+            
+            if (activePods.size > 0) {
+                connectWebSocket();
+            } else {
+                disconnectWebSocket();
+            }
+        }
+        
+        function connectWebSocket() {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                return;
+            }
+            
+            socket = new WebSocket(`ws://${window.location.host}/ws`);
+            
+            socket.onopen = function(event) {
+                updateConnectionStatus(true);
+                console.log('WebSocket connected');
+            };
+            
+            socket.onmessage = function(event) {
+                if (!isPaused) {
+                    addLogEntry(event.data);
+                }
+            };
+            
+            socket.onclose = function(event) {
+                updateConnectionStatus(false);
+                console.log('WebSocket disconnected');
+                
+                // Auto-reconnect if there are active pods
+                if (activePods.size > 0) {
+                    setTimeout(connectWebSocket, 3000);
+                }
+            };
+            
+            socket.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                updateConnectionStatus(false);
+            };
+        }
+        
+        function disconnectWebSocket() {
+            if (socket) {
+                socket.close();
+                socket = null;
+            }
+            updateConnectionStatus(false);
+        }
+        
+        function updateConnectionStatus(connected) {
+            const statusIndicator = document.getElementById('statusIndicator');
+            const statusText = document.getElementById('connectionStatus');
+            
+            if (connected) {
+                statusIndicator.className = 'status-indicator status-connected';
+                statusText.textContent = 'Connected';
+            } else {
+                statusIndicator.className = 'status-indicator status-disconnected';
+                statusText.textContent = 'Disconnected';
+            }
+        }
+        
+        function addLogEntry(logData) {
+            const logEntry = parseLogEntry(logData);
+            allLogs.push(logEntry);
+            logCounter++;
+            
+            // Keep only last 10000 logs to prevent memory issues
+            if (allLogs.length > 10000) {
+                allLogs = allLogs.slice(-5000);
+            }
+            
+            filterLogs();
+            updateLogStats();
+        }
+        
+        function parseLogEntry(logData) {
+            const timestamp = new Date().toISOString();
+            let level = 'info';
+            let pod = 'unknown';
+            let message = logData;
+            
+            // Extract pod name from log format [pod:container]
+            const podMatch = logData.match(/^\[([^:]+):([^\]]+)\]\s*(.*)/);
+            if (podMatch) {
+                pod = podMatch[1];
+                message = podMatch[3] || podMatch[0];
+            }
+            
+            // Detect log level
+            const lowerMessage = message.toLowerCase();
+            if (lowerMessage.includes('error') || lowerMessage.includes('err')) {
+                level = 'error';
+            } else if (lowerMessage.includes('warn') || lowerMessage.includes('warning')) {
+                level = 'warn';
+            } else if (lowerMessage.includes('debug')) {
+                level = 'debug';
+            }
+            
+            return {
+                id: logCounter,
+                timestamp,
+                level,
+                pod,
+                message,
+                originalData: logData
+            };
+        }
+        
+        function filterLogs() {
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            const levelFilter = document.getElementById('logLevel').value;
+            const podFilter = document.getElementById('podFilter').value.toLowerCase();
+            const timeFilter = document.getElementById('timeFilter').value;
+            
+            filteredLogs = allLogs.filter(log => {
+                // Search term filter
+                if (searchTerm && !log.message.toLowerCase().includes(searchTerm)) {
+                    return false;
+                }
+                
+                // Level filter
+                if (levelFilter && log.level !== levelFilter) {
+                    return false;
+                }
+                
+                // Pod filter
+                if (podFilter && !log.pod.toLowerCase().includes(podFilter)) {
+                    return false;
+                }
+                
+                // Time filter
+                if (timeFilter) {
+                    const filterTime = new Date(timeFilter);
+                    const logTime = new Date(log.timestamp);
+                    if (logTime < filterTime) {
+                        return false;
+                    }
+                }
+                
+                return true;
+            });
+            
+            renderLogs();
+            updateLogStats();
+        }
+        
+        function renderLogs() {
+            const logsContainer = document.getElementById('logs');
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            
+            if (filteredLogs.length === 0) {
+                logsContainer.innerHTML = '<div class="no-logs">No logs match the current filters...</div>';
+                return;
+            }
+            
+            const logsHtml = filteredLogs.slice(-1000).map(log => {
+                let message = log.message;
+                
+                // Highlight search term
+                if (searchTerm) {
+                    const regex = new RegExp(`(${searchTerm})`, 'gi');
+                    message = message.replace(regex, '<mark>$1</mark>');
+                }
+                
+                const highlightClass = searchTerm && log.message.toLowerCase().includes(searchTerm) ? 'highlight' : '';
+                
+                return `
+                    <div class="log-entry ${highlightClass}">
+                        <span class="log-timestamp">${new Date(log.timestamp).toLocaleTimeString()}</span>
+                        <span class="log-level ${log.level}">${log.level.toUpperCase()}</span>
+                        <span class="log-pod">[${log.pod}]</span>
+                        <span class="log-message">${message}</span>
+                    </div>
+                `;
+            }).join('');
+            
+            logsContainer.innerHTML = logsHtml;
+            
+            // Auto-scroll to bottom
+            logsContainer.scrollTop = logsContainer.scrollHeight;
+        }
+        
+        function updateLogStats() {
+            document.getElementById('logCount').textContent = `${allLogs.length} logs`;
+            document.getElementById('filteredCount').textContent = `${filteredLogs.length} filtered`;
+        }
+        
+        function clearLogs() {
+            allLogs = [];
+            filteredLogs = [];
+            logCounter = 0;
+            renderLogs();
+            updateLogStats();
+        }
+        
+        function exportLogs() {
+            const logsToExport = filteredLogs.length > 0 ? filteredLogs : allLogs;
+            
+            if (logsToExport.length === 0) {
+                alert('No logs to export');
+                return;
+            }
+            
+            const csvContent = 'data:text/csv;charset=utf-8,' + 
+                'Timestamp,Level,Pod,Message\n' +
+                logsToExport.map(log => 
+                    `"${log.timestamp}","${log.level}","${log.pod}","${log.message.replace(/"/g, '""')}"`
+                ).join('\n');
+            
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement('a');
+            link.setAttribute('href', encodedUri);
+            link.setAttribute('download', `truva-logs-${new Date().toISOString().slice(0,19)}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+        
+        function togglePause() {
+            isPaused = !isPaused;
+            const pauseBtn = document.getElementById('pauseBtn');
+            
+            if (isPaused) {
+                pauseBtn.textContent = 'Resume';
+                pauseBtn.style.background = '#dc3545';
+            } else {
+                pauseBtn.textContent = 'Pause';
+                pauseBtn.style.background = '#ffc107';
+            }
+        }
+        
+        // Initialize
+        updateConnectionStatus(false);
+        updateLogStats();
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey || e.metaKey) {
+                switch(e.key) {
+                    case 'f':
+                        e.preventDefault();
+                        document.getElementById('searchInput').focus();
+                        break;
+                    case 'e':
+                        e.preventDefault();
+                        exportLogs();
+                        break;
+                    case 'l':
+                        e.preventDefault();
+                        clearLogs();
+                        break;
+                }
+            }
+        });
+    </script>
 </body>
 </html>
