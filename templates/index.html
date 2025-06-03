@@ -663,3 +663,345 @@
     </script>
 </body>
 </html>
+
+        // Enhanced WebSocket connection management with automatic reconnection
+        let ws = null;
+        let reconnectAttempts = 0;
+        let maxReconnectAttempts = 10;
+        let reconnectDelay = 1000; // Start with 1 second
+        let maxReconnectDelay = 30000; // Max 30 seconds
+        let reconnectTimer = null;
+        let isManualDisconnect = false;
+        let connectionState = 'disconnected'; // 'connecting', 'connected', 'disconnected', 'error'
+        let lastConnectionTime = null;
+        let connectionQuality = 'unknown'; // 'good', 'poor', 'unknown'
+        let pingInterval = null;
+        let pongTimeout = null;
+        let lastPingTime = null;
+        let connectionMetrics = {
+            totalConnections: 0,
+            totalReconnections: 0,
+            totalErrors: 0,
+            averageLatency: 0,
+            uptime: 0
+        };
+
+        // Connection quality monitoring
+        function updateConnectionQuality(latency) {
+            if (latency < 100) {
+                connectionQuality = 'good';
+            } else if (latency < 500) {
+                connectionQuality = 'fair';
+            } else {
+                connectionQuality = 'poor';
+            }
+            updateConnectionStatus();
+        }
+
+        // Enhanced connection status display
+        function updateConnectionStatus() {
+            const statusElement = document.getElementById('connection-status');
+            const qualityElement = document.getElementById('connection-quality');
+            const metricsElement = document.getElementById('connection-metrics');
+            
+            if (statusElement) {
+                statusElement.textContent = connectionState.charAt(0).toUpperCase() + connectionState.slice(1);
+                statusElement.className = `status ${connectionState}`;
+            }
+            
+            if (qualityElement) {
+                qualityElement.textContent = connectionQuality.charAt(0).toUpperCase() + connectionQuality.slice(1);
+                qualityElement.className = `quality ${connectionQuality}`;
+            }
+            
+            if (metricsElement) {
+                const uptime = lastConnectionTime ? Math.floor((Date.now() - lastConnectionTime) / 1000) : 0;
+                metricsElement.innerHTML = `
+                    <div>Connections: ${connectionMetrics.totalConnections}</div>
+                    <div>Reconnections: ${connectionMetrics.totalReconnections}</div>
+                    <div>Errors: ${connectionMetrics.totalErrors}</div>
+                    <div>Uptime: ${uptime}s</div>
+                    <div>Avg Latency: ${connectionMetrics.averageLatency}ms</div>
+                `;
+            }
+        }
+
+        // Enhanced WebSocket connection with circuit breaker pattern
+        function connectWebSocket() {
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+                console.log('WebSocket already connecting or connected');
+                return;
+            }
+
+            if (reconnectAttempts >= maxReconnectAttempts) {
+                console.error('Max reconnection attempts reached. Please refresh the page.');
+                connectionState = 'error';
+                updateConnectionStatus();
+                showNotification('Connection failed. Please refresh the page.', 'error');
+                return;
+            }
+
+            isManualDisconnect = false;
+            connectionState = 'connecting';
+            updateConnectionStatus();
+
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws`;
+                
+                console.log(`Attempting to connect to WebSocket: ${wsUrl} (attempt ${reconnectAttempts + 1})`);
+                
+                ws = new WebSocket(wsUrl);
+                
+                // Connection timeout
+                const connectionTimeout = setTimeout(() => {
+                    if (ws.readyState === WebSocket.CONNECTING) {
+                        console.error('WebSocket connection timeout');
+                        ws.close();
+                        handleConnectionError('Connection timeout');
+                    }
+                }, 10000); // 10 second timeout
+
+                ws.onopen = function(event) {
+                    clearTimeout(connectionTimeout);
+                    console.log('WebSocket connected successfully');
+                    
+                    connectionState = 'connected';
+                    reconnectAttempts = 0;
+                    reconnectDelay = 1000; // Reset delay
+                    lastConnectionTime = Date.now();
+                    connectionMetrics.totalConnections++;
+                    
+                    if (reconnectTimer) {
+                        clearTimeout(reconnectTimer);
+                        reconnectTimer = null;
+                    }
+                    
+                    updateConnectionStatus();
+                    showNotification('Connected to log stream', 'success');
+                    
+                    // Start ping/pong monitoring
+                    startPingMonitoring();
+                };
+
+                ws.onmessage = function(event) {
+                    try {
+                        // Handle pong messages for latency calculation
+                        if (event.data === 'pong' && lastPingTime) {
+                            const latency = Date.now() - lastPingTime;
+                            connectionMetrics.averageLatency = Math.round(
+                                (connectionMetrics.averageLatency + latency) / 2
+                            );
+                            updateConnectionQuality(latency);
+                            
+                            if (pongTimeout) {
+                                clearTimeout(pongTimeout);
+                                pongTimeout = null;
+                            }
+                            return;
+                        }
+                        
+                        // Handle regular log messages
+                        if (!isPaused) {
+                            addLogEntry(event.data);
+                        }
+                    } catch (error) {
+                        console.error('Error processing WebSocket message:', error);
+                        connectionMetrics.totalErrors++;
+                        updateConnectionStatus();
+                    }
+                };
+
+                ws.onclose = function(event) {
+                    clearTimeout(connectionTimeout);
+                    stopPingMonitoring();
+                    
+                    console.log(`WebSocket closed. Code: ${event.code}, Reason: ${event.reason}, Clean: ${event.wasClean}`);
+                    
+                    if (!isManualDisconnect) {
+                        connectionState = 'disconnected';
+                        updateConnectionStatus();
+                        
+                        // Only attempt reconnection if there are active pods and it wasn't a manual disconnect
+                        if (activePods.size > 0) {
+                            scheduleReconnection();
+                        }
+                    } else {
+                        connectionState = 'disconnected';
+                        updateConnectionStatus();
+                        showNotification('Disconnected from log stream', 'info');
+                    }
+                };
+
+                ws.onerror = function(error) {
+                    clearTimeout(connectionTimeout);
+                    console.error('WebSocket error:', error);
+                    connectionMetrics.totalErrors++;
+                    handleConnectionError('WebSocket error occurred');
+                };
+
+            } catch (error) {
+                console.error('Failed to create WebSocket connection:', error);
+                handleConnectionError('Failed to create connection');
+            }
+        }
+
+        // Handle connection errors with exponential backoff
+        function handleConnectionError(errorMessage) {
+            connectionState = 'error';
+            updateConnectionStatus();
+            showNotification(errorMessage, 'error');
+            
+            if (!isManualDisconnect && activePods.size > 0) {
+                scheduleReconnection();
+            }
+        }
+
+        // Schedule reconnection with exponential backoff
+        function scheduleReconnection() {
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+            }
+            
+            reconnectAttempts++;
+            connectionMetrics.totalReconnections++;
+            
+            if (reconnectAttempts >= maxReconnectAttempts) {
+                console.error('Max reconnection attempts reached');
+                connectionState = 'error';
+                updateConnectionStatus();
+                showNotification('Connection failed permanently. Please refresh the page.', 'error');
+                return;
+            }
+            
+            // Exponential backoff with jitter
+            const jitter = Math.random() * 1000; // Add up to 1 second of jitter
+            const delay = Math.min(reconnectDelay * Math.pow(2, reconnectAttempts - 1) + jitter, maxReconnectDelay);
+            
+            console.log(`Scheduling reconnection in ${Math.round(delay)}ms (attempt ${reconnectAttempts})`);
+            
+            reconnectTimer = setTimeout(() => {
+                if (!isManualDisconnect && activePods.size > 0) {
+                    connectWebSocket();
+                }
+            }, delay);
+        }
+
+        // Start ping monitoring for connection health
+        function startPingMonitoring() {
+            stopPingMonitoring(); // Clear any existing interval
+            
+            pingInterval = setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    lastPingTime = Date.now();
+                    ws.send('ping');
+                    
+                    // Set timeout for pong response
+                    pongTimeout = setTimeout(() => {
+                        console.warn('Pong timeout - connection may be unhealthy');
+                        connectionQuality = 'poor';
+                        updateConnectionStatus();
+                    }, 5000); // 5 second timeout for pong
+                }
+            }, 30000); // Send ping every 30 seconds
+        }
+
+        // Stop ping monitoring
+        function stopPingMonitoring() {
+            if (pingInterval) {
+                clearInterval(pingInterval);
+                pingInterval = null;
+            }
+            if (pongTimeout) {
+                clearTimeout(pongTimeout);
+                pongTimeout = null;
+            }
+        }
+
+        // Enhanced disconnect function
+        function disconnectWebSocket() {
+            isManualDisconnect = true;
+            
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+            
+            stopPingMonitoring();
+            
+            if (ws) {
+                if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+                    ws.close(1000, 'Manual disconnect');
+                }
+                ws = null;
+            }
+            
+            connectionState = 'disconnected';
+            updateConnectionStatus();
+            console.log('WebSocket manually disconnected');
+        }
+
+        // Show notification to user
+        function showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+            notification.textContent = message;
+            
+            // Add to notification container or body
+            const container = document.getElementById('notifications') || document.body;
+            container.appendChild(notification);
+            
+            // Auto-remove after 5 seconds
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 5000);
+        }
+
+        // Enhanced connection monitoring
+        function monitorConnection() {
+            setInterval(() => {
+                if (ws) {
+                    if (ws.readyState === WebSocket.CLOSED && !isManualDisconnect && activePods.size > 0) {
+                        console.log('Detected closed connection, attempting reconnection');
+                        connectWebSocket();
+                    }
+                }
+                updateConnectionStatus();
+            }, 5000); // Check every 5 seconds
+        }
+
+        // Initialize connection monitoring on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            monitorConnection();
+            
+            // Add connection status elements to the page if they don't exist
+            if (!document.getElementById('connection-status')) {
+                const statusContainer = document.createElement('div');
+                statusContainer.id = 'connection-info';
+                statusContainer.innerHTML = `
+                    <div class="connection-panel">
+                        <div>Status: <span id="connection-status">Disconnected</span></div>
+                        <div>Quality: <span id="connection-quality">Unknown</span></div>
+                        <div id="connection-metrics"></div>
+                    </div>
+                `;
+                document.body.insertBefore(statusContainer, document.body.firstChild);
+            }
+            
+            // Add notification container
+            if (!document.getElementById('notifications')) {
+                const notificationContainer = document.createElement('div');
+                notificationContainer.id = 'notifications';
+                notificationContainer.style.cssText = `
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    z-index: 1000;
+                `;
+                document.body.appendChild(notificationContainer);
+            }
+        });
+
+        // ... existing code ...

@@ -43,20 +43,20 @@ func TestInitClient(t *testing.T) {
 	}
 }
 
-func TestGetClient(t *testing.T) {
+func TestGetClientset(t *testing.T) {
 	// Test when clientset is nil
 	clientset = nil
-	client := GetClient()
+	client := GetClientset()
 	if client != nil {
-		t.Errorf("GetClient() should return nil when clientset is not initialized")
+		t.Errorf("GetClientset() should return nil when clientset is not initialized")
 	}
 
 	// Test when clientset is set
 	fakeClientset := fake.NewSimpleClientset()
 	clientset = fakeClientset
-	client = GetClient()
+	client = GetClientset()
 	if client == nil {
-		t.Errorf("GetClient() should return clientset when initialized")
+		t.Errorf("GetClientset() should return clientset when initialized")
 	}
 }
 

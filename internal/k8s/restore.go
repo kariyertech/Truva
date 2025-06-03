@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/kariyertech/Truva.git/pkg/errors"
 )
 
 func RestoreDeployment(namespace, deploymentName string) error {
@@ -17,7 +19,7 @@ func RestoreDeployment(namespace, deploymentName string) error {
 	restoreCmd := exec.Command("kubectl", "replace", "-f", backupFile, "--force")
 	restoreOutput, err := restoreCmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("Error replacing deployment: %s\nOutput: %s\n", err, restoreOutput)
+		errors.Handle(errors.K8sError("replace deployment", err).WithContext("output", string(restoreOutput)))
 
 		backupData, err := os.ReadFile(backupFile)
 		if err != nil {
@@ -30,11 +32,11 @@ func RestoreDeployment(namespace, deploymentName string) error {
 			return fmt.Errorf("failed to patch deployment: %s\nOutput: %s", err, patchOutput)
 		}
 
-		fmt.Printf("Deployment %s restored successfully using patch.\n", deploymentName)
+		errors.Info("DEPLOYMENT_RESTORE_PATCH_SUCCESS", "Deployment "+deploymentName+" restored successfully using patch.")
 		return nil
 	}
 
-	fmt.Printf("Deployment %s restored successfully.\nOutput: %s\n", deploymentName, restoreOutput)
+	errors.Info("DEPLOYMENT_RESTORE_SUCCESS", "Deployment "+deploymentName+" restored successfully.")
 
 	restartCmd := exec.Command("kubectl", "rollout", "restart", "deployment", deploymentName, "-n", namespace)
 	restartOutput, err := restartCmd.CombinedOutput()
@@ -42,6 +44,6 @@ func RestoreDeployment(namespace, deploymentName string) error {
 		return fmt.Errorf("failed to restart deployment: %s\nOutput: %s", err, restartOutput)
 	}
 
-	fmt.Printf("Deployment %s restarted successfully.\nOutput: %s\n", deploymentName, restartOutput)
+	errors.Info("DEPLOYMENT_RESTART_SUCCESS", "Deployment "+deploymentName+" restarted successfully.")
 	return nil
 }

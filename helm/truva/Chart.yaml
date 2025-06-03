@@ -1,0 +1,19 @@
+apiVersion: v2
+name: truva
+description: A Helm chart for Truva Kubernetes Development Tool
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+home: https://github.com/truva/truva
+sources:
+- https://github.com/truva/truva
+maintainers:
+- name: Truva Team
+  email: team@truva.dev
+keywords:
+- kubernetes
+- development
+- devtools
+- k8s
+annotations:
+  category: DeveloperTools

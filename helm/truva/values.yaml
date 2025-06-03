@@ -1,0 +1,181 @@
+# Default values for truva.
+replicaCount: 3
+
+image:
+  repository: truva
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  hosts:
+    - host: truva.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: truva-tls
+      hosts:
+        - truva.example.com
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/name
+            operator: In
+            values:
+            - truva
+        topologyKey: kubernetes.io/hostname
+
+config:
+  server:
+    host: "0.0.0.0"
+    port: 8080
+    tls:
+      enabled: false
+  logging:
+    level: "info"
+    format: "json"
+    output: "stdout"
+  logAggregation:
+    enabled: true
+    signoz:
+      enabled: true
+      endpoint: "http://signoz-otel-collector:4317"
+      apiKey: ""
+      batchSize: 100
+      flushInterval: "5s"
+      timeout: "10s"
+  kubernetes:
+    inCluster: true
+    namespace: "default"
+  ui:
+    enabled: true
+    path: "/ui"
+  sync:
+    enabled: true
+    interval: "30s"
+    batchSize: 50
+    timeout: "10s"
+  monitoring:
+    enabled: true
+    metricsPath: "/metrics"
+    healthPath: "/health"
+    readyPath: "/ready"
+  secrets:
+    encryptionKey: "your-32-byte-encryption-key-here"
+  rateLimiting:
+    enabled: true
+    requestsPerMinute: 100
+    burst: 10
+    websocket:
+      connectionsPerIp: 5
+      messageRate: 50
+
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "services", "endpoints", "persistentvolumeclaims", "events", "configmaps", "secrets"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    - apiGroups: ["apps"]
+      resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    - apiGroups: ["extensions", "networking.k8s.io"]
+      resources: ["ingresses", "networkpolicies"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    - apiGroups: ["batch"]
+      resources: ["jobs", "cronjobs"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 2
+
+networkPolicy:
+  enabled: false
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            name: ingress-nginx
+      - namespaceSelector:
+          matchLabels:
+            name: monitoring
+      ports:
+      - protocol: TCP
+        port: 8080
+  egress:
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: kube-system
+      ports:
+      - protocol: TCP
+        port: 443
+      - protocol: UDP
+        port: 53
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: monitoring
+      ports:
+      - protocol: TCP
+        port: 4317

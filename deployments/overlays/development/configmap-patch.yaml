@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: truva-config
+data:
+  config.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 8080
+      tls:
+        enabled: false
+    
+    logging:
+      level: "debug"
+      format: "text"
+      output: "stdout"
+    
+    log_aggregation:
+      enabled: false
+    
+    kubernetes:
+      in_cluster: true
+      namespace: "truva-dev"
+    
+    ui:
+      enabled: true
+      path: "/ui"
+    
+    sync:
+      enabled: true
+      interval: "10s"
+      batch_size: 10
+      timeout: "5s"
+    
+    monitoring:
+      enabled: true
+      metrics_path: "/metrics"
+      health_path: "/health"
+      ready_path: "/ready"
+    
+    secrets:
+      encryption_key: "dev-32-byte-encryption-key-here!!"
+    
+    rate_limiting:
+      enabled: false

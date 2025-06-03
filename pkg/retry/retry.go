@@ -3,9 +3,13 @@ package retry
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kariyertech/Truva.git/pkg/utils"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // RetryConfig defines the configuration for retry operations
@@ -55,6 +59,9 @@ func KubernetesConfig() *RetryConfig {
 			"internal server error",
 			"bad gateway",
 			"gateway timeout",
+			"rate limit exceeded",
+			"throttled",
+			"quota exceeded",
 		},
 	}
 }
@@ -102,7 +109,13 @@ func Do(ctx context.Context, config *RetryConfig, fn RetryableFunc) error {
 			break
 		}
 
-		utils.Logger.Warn(fmt.Sprintf("Attempt %d failed: %v. Retrying in %v...", attempt, err, delay))
+		// Check for rate limit and adjust delay accordingly
+		if rateLimitDelay := extractRateLimitDelay(err); rateLimitDelay > 0 {
+			delay = rateLimitDelay
+			utils.Logger.Warn(fmt.Sprintf("Rate limit detected on attempt %d. Waiting %v before retry...", attempt, delay))
+		} else {
+			utils.Logger.Warn(fmt.Sprintf("Attempt %d failed: %v. Retrying in %v...", attempt, err, delay))
+		}
 
 		// Wait before retry
 		select {
@@ -111,10 +124,15 @@ func Do(ctx context.Context, config *RetryConfig, fn RetryableFunc) error {
 		case <-time.After(delay):
 		}
 
-		// Calculate next delay with exponential backoff
-		delay = time.Duration(float64(delay) * config.BackoffFactor)
-		if delay > config.MaxDelay {
-			delay = config.MaxDelay
+		// Calculate next delay with exponential backoff (only if not rate limited)
+		if extractRateLimitDelay(err) == 0 {
+			delay = time.Duration(float64(delay) * config.BackoffFactor)
+			if delay > config.MaxDelay {
+				delay = config.MaxDelay
+			}
+		} else {
+			// Reset delay for next attempt after rate limit
+			delay = config.InitialDelay
 		}
 	}
 
@@ -184,12 +202,76 @@ func isRetryableError(err error, retryableErrors []string) bool {
 		return false
 	}
 
-	errorStr := err.Error()
+	// Check for Kubernetes-specific errors
+	if isKubernetesRetryableError(err) {
+		return true
+	}
+
+	errorStr := strings.ToLower(err.Error())
+
 	for _, retryableError := range retryableErrors {
-		if contains(errorStr, retryableError) {
+		substr := strings.ToLower(retryableError)
+		if len(substr) <= len(errorStr) &&
+			(strings.Contains(errorStr, substr) ||
+				(errorStr[:len(substr)] == substr ||
+					errorStr[len(errorStr)-len(substr):] == substr ||
+					indexOfSubstring(errorStr, substr) >= 0)) {
 			return true
 		}
 	}
+	return false
+}
+
+// isKubernetesRetryableError checks for Kubernetes-specific retryable errors
+func isKubernetesRetryableError(err error) bool {
+	if k8sErr, ok := err.(*k8serrors.StatusError); ok {
+		status := k8sErr.ErrStatus
+
+		// Check for retryable HTTP status codes
+		switch status.Code {
+		case http.StatusTooManyRequests: // 429
+			return true
+		case http.StatusInternalServerError: // 500
+			return true
+		case http.StatusBadGateway: // 502
+			return true
+		case http.StatusServiceUnavailable: // 503
+			return true
+		case http.StatusGatewayTimeout: // 504
+			return true
+		}
+
+		// Check for specific Kubernetes error reasons
+		switch status.Reason {
+		case "Timeout":
+			return true
+		case "ServerTimeout":
+			return true
+		case "ServiceUnavailable":
+			return true
+		case "InternalError":
+			return true
+		}
+	}
+
+	// Check for network-related errors
+	errorStr := strings.ToLower(err.Error())
+	networkErrors := []string{
+		"connection reset by peer",
+		"broken pipe",
+		"no route to host",
+		"connection timed out",
+		"i/o timeout",
+		"network is down",
+		"host is down",
+	}
+
+	for _, netErr := range networkErrors {
+		if strings.Contains(errorStr, netErr) {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -281,4 +363,77 @@ func (cb *CircuitBreaker) onFailure() {
 // GetState returns the current state of the circuit breaker
 func (cb *CircuitBreaker) GetState() CircuitState {
 	return cb.state
+}
+
+// extractRateLimitDelay extracts the retry-after delay from rate limit errors
+func extractRateLimitDelay(err error) time.Duration {
+	if k8sErr, ok := err.(*k8serrors.StatusError); ok {
+		status := k8sErr.ErrStatus
+
+		// Check for 429 Too Many Requests
+		if status.Code == http.StatusTooManyRequests {
+			// Look for Retry-After header in the error details
+			if status.Details != nil {
+				for _, cause := range status.Details.Causes {
+					if cause.Type == "RetryAfter" {
+						if seconds, err := strconv.Atoi(cause.Message); err == nil {
+							return time.Duration(seconds) * time.Second
+						}
+					}
+				}
+			}
+			// Default rate limit delay
+			return 30 * time.Second
+		}
+	}
+
+	// Check error message for rate limit indicators
+	errorStr := strings.ToLower(err.Error())
+	if strings.Contains(errorStr, "rate limit") ||
+		strings.Contains(errorStr, "too many requests") ||
+		strings.Contains(errorStr, "throttled") {
+		return 15 * time.Second
+	}
+
+	return 0
+}
+
+// KubernetesRetryWithCircuitBreaker combines retry logic with circuit breaker for Kubernetes operations
+func KubernetesRetryWithCircuitBreaker(ctx context.Context, fn func() error) error {
+	cb := NewCircuitBreaker(5, 30*time.Second)
+	retryConfig := KubernetesConfig()
+
+	return cb.Execute(func() error {
+		return Do(ctx, retryConfig, fn)
+	})
+}
+
+// KubernetesRetryWithCircuitBreakerResult combines retry logic with circuit breaker for Kubernetes operations that return a result
+func KubernetesRetryWithCircuitBreakerResult[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	cb := NewCircuitBreaker(5, 30*time.Second)
+	retryConfig := KubernetesConfig()
+
+	var result T
+	err := cb.Execute(func() error {
+		var err error
+		result, err = DoWithResult(ctx, retryConfig, fn)
+		return err
+	})
+	return result, err
+}
+
+// GetRetryStats returns statistics about retry operations
+type RetryStats struct {
+	TotalAttempts     int           `json:"total_attempts"`
+	SuccessfulRetries int           `json:"successful_retries"`
+	FailedOperations  int           `json:"failed_operations"`
+	AverageDelay      time.Duration `json:"average_delay"`
+	RateLimitHits     int           `json:"rate_limit_hits"`
+}
+
+var globalRetryStats = &RetryStats{}
+
+// GetGlobalRetryStats returns the global retry statistics
+func GetGlobalRetryStats() RetryStats {
+	return *globalRetryStats
 }

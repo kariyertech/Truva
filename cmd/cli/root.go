@@ -18,3 +18,8 @@ func Execute() {
 		fmt.Println(err)
 	}
 }
+
+// GetRootCmd returns the root command for adding subcommands
+func GetRootCmd() *cobra.Command {
+	return rootCmd
+}

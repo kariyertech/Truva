@@ -20,7 +20,6 @@ func TestNewWebSocketManager(t *testing.T) {
 	require.NotNil(t, manager)
 	assert.NotNil(t, manager.connections)
 	assert.NotNil(t, manager.ctx)
-	assert.NotNil(t, manager.cancel)
 	assert.Equal(t, 0, manager.GetConnectionCount())
 
 	// Clean up

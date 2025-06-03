@@ -1,0 +1,104 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+README*
+docs/
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+app.log
+
+# Test files
+*_test.go
+tests/
+test/
+coverage.out
+coverage.html
+
+# Build artifacts
+truva
+*.exe
+*.dll
+*.so
+*.dylib
+dist/
+build/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Secrets and credentials
+secrets.enc
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# Kubernetes config (sensitive)
+.kube/
+kubeconfig
+
+# Docker files (avoid recursion)
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+# CI/CD files
+.github/
+.gitlab-ci.yml
+.travis.yml
+Jenkinsfile
+
+# Package managers
+node_modules/
+vendor/
+
+# Production tasks file
+tasks-production.json
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Cache directories
+.cache/
+.npm/
+.yarn/

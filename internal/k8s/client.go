@@ -7,8 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/kariyertech/Truva.git/pkg/config"
+	"github.com/kariyertech/Truva.git/pkg/credentials"
+	"github.com/kariyertech/Truva.git/pkg/errors"
+	"github.com/kariyertech/Truva.git/pkg/recovery"
 	"github.com/kariyertech/Truva.git/pkg/retry"
 	"github.com/kariyertech/Truva.git/pkg/utils"
 	corev1 "k8s.io/api/core/v1"
@@ -17,13 +22,303 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-var clientset kubernetes.Interface
+// CacheConfig holds configuration for API response caching
+type CacheConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	TTL             time.Duration `yaml:"ttl"`
+	MaxSize         int           `yaml:"max_size"`
+	CleanupInterval time.Duration `yaml:"cleanup_interval"`
+}
+
+// DefaultCacheConfig returns default cache configuration
+func DefaultCacheConfig() *CacheConfig {
+	return &CacheConfig{
+		Enabled:         true,
+		TTL:             5 * time.Minute,
+		MaxSize:         1000,
+		CleanupInterval: 10 * time.Minute,
+	}
+}
+
+// CacheEntry represents a cached API response
+type CacheEntry struct {
+	Data      interface{}
+	Timestamp time.Time
+	TTL       time.Duration
+}
+
+// IsExpired checks if the cache entry has expired
+func (e *CacheEntry) IsExpired() bool {
+	return time.Since(e.Timestamp) > e.TTL
+}
+
+// APICache provides caching for Kubernetes API responses
+type APICache struct {
+	mu      sync.RWMutex
+	entries map[string]*CacheEntry
+	config  *CacheConfig
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+// NewAPICache creates a new API cache
+func NewAPICache(config *CacheConfig) *APICache {
+	ctx, cancel := context.WithCancel(context.Background())
+	cache := &APICache{
+		entries: make(map[string]*CacheEntry),
+		config:  config,
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+
+	if config.Enabled {
+		go cache.startCleanup()
+	}
+
+	return cache
+}
+
+// Get retrieves a value from cache
+func (c *APICache) Get(key string) (interface{}, bool) {
+	if !c.config.Enabled {
+		return nil, false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.entries[key]
+	if !exists || entry.IsExpired() {
+		return nil, false
+	}
+
+	return entry.Data, true
+}
+
+// Set stores a value in cache
+func (c *APICache) Set(key string, value interface{}, ttl time.Duration) {
+	if !c.config.Enabled {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check if we need to evict entries
+	if len(c.entries) >= c.config.MaxSize {
+		c.evictOldest()
+	}
+
+	c.entries[key] = &CacheEntry{
+		Data:      value,
+		Timestamp: time.Now(),
+		TTL:       ttl,
+	}
+}
+
+// Delete removes a value from cache
+func (c *APICache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
+
+// Clear removes all entries from cache
+func (c *APICache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]*CacheEntry)
+}
+
+// startCleanup starts the background cleanup routine
+func (c *APICache) startCleanup() {
+	ticker := time.NewTicker(c.config.CleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.cleanup()
+		}
+	}
+}
+
+// cleanup removes expired entries
+func (c *APICache) cleanup() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key, entry := range c.entries {
+		if entry.IsExpired() {
+			delete(c.entries, key)
+		}
+	}
+}
+
+// evictOldest removes the oldest entry
+func (c *APICache) evictOldest() {
+	var oldestKey string
+	var oldestTime time.Time
+
+	for key, entry := range c.entries {
+		if oldestKey == "" || entry.Timestamp.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = entry.Timestamp
+		}
+	}
+
+	if oldestKey != "" {
+		delete(c.entries, oldestKey)
+	}
+}
+
+// Stop stops the cache cleanup routine
+func (c *APICache) Stop() {
+	c.cancel()
+}
+
+// GetStats returns cache statistics
+func (c *APICache) GetStats() map[string]interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	expired := 0
+	for _, entry := range c.entries {
+		if entry.IsExpired() {
+			expired++
+		}
+	}
+
+	return map[string]interface{}{
+		"total_entries":   len(c.entries),
+		"expired_entries": expired,
+		"max_size":        c.config.MaxSize,
+		"enabled":         c.config.Enabled,
+	}
+}
+
+// BatchRequest represents a batch API request
+type BatchRequest struct {
+	ID       string
+	Type     string
+	Params   map[string]interface{}
+	Callback func(interface{}, error)
+}
+
+// BatchProcessor handles batch API requests
+type BatchProcessor struct {
+	mu           sync.Mutex
+	requests     []*BatchRequest
+	batchSize    int
+	batchTimeout time.Duration
+	processor    func([]*BatchRequest) error
+	timer        *time.Timer
+	ctx          context.Context
+	cancel       context.CancelFunc
+}
+
+// NewBatchProcessor creates a new batch processor
+func NewBatchProcessor(batchSize int, batchTimeout time.Duration, processor func([]*BatchRequest) error) *BatchProcessor {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &BatchProcessor{
+		requests:     make([]*BatchRequest, 0),
+		batchSize:    batchSize,
+		batchTimeout: batchTimeout,
+		processor:    processor,
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
+
+// AddRequest adds a request to the batch
+func (bp *BatchProcessor) AddRequest(req *BatchRequest) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	bp.requests = append(bp.requests, req)
+
+	// Process immediately if batch is full
+	if len(bp.requests) >= bp.batchSize {
+		bp.processBatch()
+		return
+	}
+
+	// Set timer for batch timeout if this is the first request
+	if len(bp.requests) == 1 {
+		bp.timer = time.AfterFunc(bp.batchTimeout, func() {
+			bp.mu.Lock()
+			defer bp.mu.Unlock()
+			if len(bp.requests) > 0 {
+				bp.processBatch()
+			}
+		})
+	}
+}
+
+// processBatch processes the current batch of requests
+func (bp *BatchProcessor) processBatch() {
+	if len(bp.requests) == 0 {
+		return
+	}
+
+	// Stop the timer if it's running
+	if bp.timer != nil {
+		bp.timer.Stop()
+		bp.timer = nil
+	}
+
+	// Process the batch
+	batch := make([]*BatchRequest, len(bp.requests))
+	copy(batch, bp.requests)
+	bp.requests = bp.requests[:0] // Clear the slice
+
+	// Process in background
+	recovery.SafeGoWithContext(bp.ctx, func(ctx context.Context) {
+		err := bp.processor(batch)
+		if err != nil {
+			// Call error callbacks
+			for _, req := range batch {
+				if req.Callback != nil {
+					req.Callback(nil, err)
+				}
+			}
+		}
+	}, map[string]interface{}{
+		"component":  "batch_processor",
+		"batch_size": len(batch),
+	})
+}
+
+// Stop stops the batch processor
+func (bp *BatchProcessor) Stop() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	// Process remaining requests
+	if len(bp.requests) > 0 {
+		bp.processBatch()
+	}
+
+	bp.cancel()
+}
+
+var (
+	clientset      kubernetes.Interface
+	secureClient   *credentials.SecureK8sClient
+	credManager    *credentials.CredentialsManager
+	apiCache       *APICache
+	batchProcessor *BatchProcessor
+	cacheConfig    *CacheConfig
+)
 
 type DeploymentLabels map[string]string
 
 // DefaultKubernetesClient implements the KubernetesClient interface
 type DefaultKubernetesClient struct {
 	clientset kubernetes.Interface
+	cache     *APICache
 }
 
 // NewKubernetesClient creates a new instance of DefaultKubernetesClient
@@ -34,6 +329,7 @@ func NewKubernetesClient() (KubernetesClient, error) {
 	}
 	return &DefaultKubernetesClient{
 		clientset: clientset,
+		cache:     apiCache,
 	}, nil
 }
 
@@ -45,6 +341,7 @@ func NewKubernetesClientWithContext(ctx context.Context) (KubernetesClient, erro
 	}
 	return &DefaultKubernetesClient{
 		clientset: clientset,
+		cache:     apiCache,
 	}, nil
 }
 
@@ -53,36 +350,446 @@ func InitClient() error {
 }
 
 func InitClientWithContext(ctx context.Context) error {
-	retryConfig := retry.KubernetesConfig()
+	// Initialize cache if not already done
+	if apiCache == nil {
+		cacheConfig = DefaultCacheConfig()
+		apiCache = NewAPICache(cacheConfig)
+	}
 
-	return retry.Do(ctx, retryConfig, func() error {
-		kubeconfig := os.Getenv("KUBECONFIG")
-		if kubeconfig == "" {
-			kubeconfig = clientcmd.RecommendedHomeFile
+	// Initialize batch processor if not already done
+	if batchProcessor == nil {
+		batchProcessor = NewBatchProcessor(10, 100*time.Millisecond, processBatchRequests)
+	}
+
+	// Get configuration
+	cfg := config.GetConfig()
+
+	// Initialize credentials manager if enabled
+	if cfg.Credentials.Enabled {
+		// Get master password from environment variable
+		masterPassword := os.Getenv("TRUVA_MASTER_PASSWORD")
+		if masterPassword == "" {
+			masterPassword = cfg.Credentials.MasterPassword
+		}
+		if masterPassword == "" {
+			return fmt.Errorf("master password not set. Please set TRUVA_MASTER_PASSWORD environment variable")
 		}
 
-		config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		// Initialize credentials manager
+		var err error
+		credManager, err = credentials.NewCredentialsManager(cfg.Credentials.StorePath, masterPassword)
 		if err != nil {
-			return fmt.Errorf("failed to build config from KUBECONFIG: %w", err)
+			return fmt.Errorf("failed to initialize credentials manager: %w", err)
 		}
 
-		clientset, err = kubernetes.NewForConfig(config)
+		// Initialize secure client
+		secureClient = credentials.NewSecureK8sClient(credManager)
+
+		// Try to initialize from stored config first
+		err = secureClient.InitializeFromStoredConfig()
 		if err != nil {
-			return fmt.Errorf("failed to create Kubernetes clientset: %w", err)
+			// If no stored config, try to load from kubeconfig file
+			kubeconfigPath := os.Getenv("KUBECONFIG")
+			if kubeconfigPath == "" {
+				kubeconfigPath = clientcmd.RecommendedHomeFile
+			}
+
+			// Check if running in cluster
+			if _, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token"); err == nil {
+				// Running in cluster, use in-cluster config
+				err = secureClient.InitializeInCluster()
+				if err != nil {
+					return fmt.Errorf("failed to initialize in-cluster client: %w", err)
+				}
+			} else {
+				// Load and store kubeconfig
+				err = secureClient.InitializeFromKubeconfig(kubeconfigPath)
+				if err != nil {
+					return fmt.Errorf("failed to initialize secure client from kubeconfig: %w", err)
+				}
+			}
 		}
 
-		// Test the connection
-		_, err = clientset.Discovery().ServerVersion()
-		if err != nil {
-			return fmt.Errorf("failed to connect to Kubernetes cluster: %w", err)
-		}
+		// Get clientset from secure client
+		clientset = secureClient.GetClientset()
 
-		return nil
-	})
+		// Setup credential rotation if enabled
+		if cfg.Credentials.RotationEnabled {
+			recovery.SafeGoWithContext(ctx, func(ctx context.Context) {
+				startCredentialRotation(ctx, cfg.Credentials.RotationHours)
+			}, map[string]interface{}{})
+		}
+	} else {
+		// Fallback to traditional method if credentials management is disabled
+		return retry.KubernetesRetryWithCircuitBreaker(ctx, func() error {
+			kubeconfig := os.Getenv("KUBECONFIG")
+			if kubeconfig == "" {
+				kubeconfig = clientcmd.RecommendedHomeFile
+			}
+
+			config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+			if err != nil {
+				return fmt.Errorf("failed to build config from KUBECONFIG: %w", err)
+			}
+
+			clientset, err = kubernetes.NewForConfig(config)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes clientset: %w", err)
+			}
+
+			// Test the connection
+			_, err = clientset.Discovery().ServerVersion()
+			if err != nil {
+				return fmt.Errorf("failed to connect to Kubernetes cluster: %w", err)
+			}
+
+			return nil
+		})
+	}
+
+	return nil
 }
 
-func GetClient() kubernetes.Interface {
+func GetClientset() kubernetes.Interface {
 	return clientset
+}
+
+// GetAPICache returns the API cache instance
+func GetAPICache() *APICache {
+	return apiCache
+}
+
+// GetBatchProcessor returns the batch processor instance
+func GetBatchProcessor() *BatchProcessor {
+	return batchProcessor
+}
+
+// GetSecureClient returns the secure Kubernetes client
+func GetSecureClient() *credentials.SecureK8sClient {
+	return secureClient
+}
+
+// GetCredentialsManager returns the credentials manager
+func GetCredentialsManager() *credentials.CredentialsManager {
+	return credManager
+}
+
+// processBatchRequests processes a batch of API requests
+func processBatchRequests(requests []*BatchRequest) error {
+	// Group requests by type for efficient processing
+	requestGroups := make(map[string][]*BatchRequest)
+	for _, req := range requests {
+		requestGroups[req.Type] = append(requestGroups[req.Type], req)
+	}
+
+	// Process each group
+	for requestType, group := range requestGroups {
+		switch requestType {
+		case "list_pods":
+			err := processPodListBatch(group)
+			if err != nil {
+				return fmt.Errorf("failed to process pod list batch: %w", err)
+			}
+		case "list_services":
+			err := processServiceListBatch(group)
+			if err != nil {
+				return fmt.Errorf("failed to process service list batch: %w", err)
+			}
+		case "list_deployments":
+			err := processDeploymentListBatch(group)
+			if err != nil {
+				return fmt.Errorf("failed to process deployment list batch: %w", err)
+			}
+		default:
+			// Process individually for unknown types
+			for _, req := range group {
+				if req.Callback != nil {
+					req.Callback(nil, fmt.Errorf("unknown request type: %s", requestType))
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// processPodListBatch processes a batch of pod list requests
+func processPodListBatch(requests []*BatchRequest) error {
+	// Group by namespace for efficient API calls
+	namespaceGroups := make(map[string][]*BatchRequest)
+	for _, req := range requests {
+		namespace := req.Params["namespace"].(string)
+		namespaceGroups[namespace] = append(namespaceGroups[namespace], req)
+	}
+
+	// Process each namespace
+	for namespace, group := range namespaceGroups {
+		// Check cache first
+		cacheKey := fmt.Sprintf("pods:%s", namespace)
+		if cached, found := apiCache.Get(cacheKey); found {
+			// Return cached result to all requests in this group
+			for _, req := range group {
+				if req.Callback != nil {
+					req.Callback(cached, nil)
+				}
+			}
+			continue
+		}
+
+		// Make API call
+		pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			// Return error to all requests in this group
+			for _, req := range group {
+				if req.Callback != nil {
+					req.Callback(nil, err)
+				}
+			}
+			continue
+		}
+
+		// Cache the result
+		apiCache.Set(cacheKey, pods, cacheConfig.TTL)
+
+		// Return result to all requests in this group
+		for _, req := range group {
+			if req.Callback != nil {
+				req.Callback(pods, nil)
+			}
+		}
+	}
+
+	return nil
+}
+
+// processServiceListBatch processes a batch of service list requests
+func processServiceListBatch(requests []*BatchRequest) error {
+	// Group by namespace for efficient API calls
+	namespaceGroups := make(map[string][]*BatchRequest)
+	for _, req := range requests {
+		namespace := req.Params["namespace"].(string)
+		namespaceGroups[namespace] = append(namespaceGroups[namespace], req)
+	}
+
+	// Process each namespace
+	for namespace, group := range namespaceGroups {
+		// Check cache first
+		cacheKey := fmt.Sprintf("services:%s", namespace)
+		if cached, found := apiCache.Get(cacheKey); found {
+			// Return cached result to all requests in this group
+			for _, req := range group {
+				if req.Callback != nil {
+					req.Callback(cached, nil)
+				}
+			}
+			continue
+		}
+
+		// Make API call
+		services, err := clientset.CoreV1().Services(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			// Return error to all requests in this group
+			for _, req := range group {
+				if req.Callback != nil {
+					req.Callback(nil, err)
+				}
+			}
+			continue
+		}
+
+		// Cache the result
+		apiCache.Set(cacheKey, services, cacheConfig.TTL)
+
+		// Return result to all requests in this group
+		for _, req := range group {
+			if req.Callback != nil {
+				req.Callback(services, nil)
+			}
+		}
+	}
+
+	return nil
+}
+
+// processDeploymentListBatch processes a batch of deployment list requests
+func processDeploymentListBatch(requests []*BatchRequest) error {
+	// Group by namespace for efficient API calls
+	namespaceGroups := make(map[string][]*BatchRequest)
+	for _, req := range requests {
+		namespace := req.Params["namespace"].(string)
+		namespaceGroups[namespace] = append(namespaceGroups[namespace], req)
+	}
+
+	// Process each namespace
+	for namespace, group := range namespaceGroups {
+		// Check cache first
+		cacheKey := fmt.Sprintf("deployments:%s", namespace)
+		if cached, found := apiCache.Get(cacheKey); found {
+			// Return cached result to all requests in this group
+			for _, req := range group {
+				if req.Callback != nil {
+					req.Callback(cached, nil)
+				}
+			}
+			continue
+		}
+
+		// Make API call
+		deployments, err := clientset.AppsV1().Deployments(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			// Return error to all requests in this group
+			for _, req := range group {
+				if req.Callback != nil {
+					req.Callback(nil, err)
+				}
+			}
+			continue
+		}
+
+		// Cache the result
+		apiCache.Set(cacheKey, deployments, cacheConfig.TTL)
+
+		// Return result to all requests in this group
+		for _, req := range group {
+			if req.Callback != nil {
+				req.Callback(deployments, nil)
+			}
+		}
+	}
+
+	return nil
+}
+
+// CachedListPods returns pods with caching support
+func (c *DefaultKubernetesClient) CachedListPods(ctx context.Context, namespace string) (*corev1.PodList, error) {
+	cacheKey := fmt.Sprintf("pods:%s", namespace)
+
+	// Check cache first
+	if cached, found := c.cache.Get(cacheKey); found {
+		if pods, ok := cached.(*corev1.PodList); ok {
+			return pods, nil
+		}
+	}
+
+	// Make API call with retry
+	var pods *corev1.PodList
+	err := retry.KubernetesRetryWithCircuitBreaker(ctx, func() error {
+		var err error
+		pods, err = c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		return err
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the result
+	c.cache.Set(cacheKey, pods, cacheConfig.TTL)
+
+	return pods, nil
+}
+
+// BatchListPods adds a pod list request to the batch processor
+func (c *DefaultKubernetesClient) BatchListPods(namespace string, callback func(*corev1.PodList, error)) {
+	req := &BatchRequest{
+		ID:   fmt.Sprintf("pods_%s_%d", namespace, time.Now().UnixNano()),
+		Type: "list_pods",
+		Params: map[string]interface{}{
+			"namespace": namespace,
+		},
+		Callback: func(data interface{}, err error) {
+			if err != nil {
+				callback(nil, err)
+				return
+			}
+			if pods, ok := data.(*corev1.PodList); ok {
+				callback(pods, nil)
+			} else {
+				callback(nil, fmt.Errorf("invalid data type for pod list"))
+			}
+		},
+	}
+
+	batchProcessor.AddRequest(req)
+}
+
+// InvalidateCache invalidates cache entries for a specific resource type
+func (c *DefaultKubernetesClient) InvalidateCache(resourceType, namespace string) {
+	cacheKey := fmt.Sprintf("%s:%s", resourceType, namespace)
+	c.cache.Delete(cacheKey)
+}
+
+// GetCacheStats returns cache statistics
+func (c *DefaultKubernetesClient) GetCacheStats() map[string]interface{} {
+	return c.cache.GetStats()
+}
+
+// startCredentialRotation starts a background goroutine for credential rotation
+func startCredentialRotation(ctx context.Context, rotationHours int) {
+	ticker := time.NewTicker(time.Duration(rotationHours) * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if secureClient != nil {
+				// Check if credential is expired
+				expired, err := secureClient.IsCredentialExpired()
+				if err != nil {
+					errors.Warning("CREDENTIAL_EXPIRATION_CHECK_FAILED", "Error checking credential expiration: "+err.Error())
+					continue
+				}
+
+				if expired {
+					fmt.Println("Kubernetes credentials expired, attempting rotation...")
+					// Try to reload from kubeconfig
+					kubeconfigPath := os.Getenv("KUBECONFIG")
+					if kubeconfigPath == "" {
+						kubeconfigPath = clientcmd.RecommendedHomeFile
+					}
+
+					err = secureClient.RotateCredentials(kubeconfigPath)
+					if err != nil {
+						errors.Warning("CREDENTIAL_ROTATION_FAILED", "Failed to rotate credentials: "+err.Error())
+					} else {
+						errors.Info("CREDENTIAL_ROTATION_SUCCESS", "Credentials rotated successfully")
+						// Update global clientset
+						clientset = secureClient.GetClientset()
+						// Clear cache after credential rotation
+						if apiCache != nil {
+							apiCache.Clear()
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// ValidateCredentials validates the current stored credentials
+func ValidateCredentials() error {
+	if secureClient == nil {
+		return fmt.Errorf("secure client not initialized")
+	}
+	return secureClient.ValidateStoredConfig()
+}
+
+// RotateCredentials manually rotates the Kubernetes credentials
+func RotateCredentials(newKubeconfigPath string) error {
+	if secureClient == nil {
+		return fmt.Errorf("secure client not initialized")
+	}
+
+	err := secureClient.RotateCredentials(newKubeconfigPath)
+	if err != nil {
+		return err
+	}
+
+	// Update global clientset
+	clientset = secureClient.GetClientset()
+	return nil
 }
 
 func CopyToPod(localPath, namespace, podName, containerPath string) error {
@@ -123,9 +830,7 @@ func (c *DefaultKubernetesClient) CopyToPodWithContext(ctx context.Context, loca
 // Returns:
 //   - error: Any error encountered during the copy operation
 func copyToPodWithContext(ctx context.Context, localPath, namespace, podName, containerPath string) error {
-	retryConfig := retry.KubernetesConfig()
-
-	return retry.Do(ctx, retryConfig, func() error {
+	return retry.KubernetesRetryWithCircuitBreaker(ctx, func() error {
 		var cmd *exec.Cmd
 		if isDirectory(localPath) {
 			cmd = exec.Command("kubectl", "cp", fmt.Sprintf("%s/.", localPath), fmt.Sprintf("%s/%s:%s", namespace, podName, containerPath))
@@ -191,9 +896,7 @@ func (c *DefaultKubernetesClient) RestartProcessWithContext(ctx context.Context,
 }
 
 func restartProcessWithContext(ctx context.Context, namespace, podName, processName, startCommand string) error {
-	retryConfig := retry.KubernetesConfig()
-
-	return retry.Do(ctx, retryConfig, func() error {
+	return retry.KubernetesRetryWithCircuitBreaker(ctx, func() error {
 		// Check if process is running
 		checkCmd := exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", "pgrep", "-f", processName)
 		if err := checkCmd.Run(); err != nil {
@@ -285,10 +988,8 @@ func (c *DefaultKubernetesClient) GetDeploymentSelectorWithContext(ctx context.C
 //   - string: Comma-separated label selector (e.g., "app=myapp,version=v1")
 //   - error: Any error encountered during API communication or processing
 func getDeploymentSelectorWithContext(ctx context.Context, namespace, deploymentName string) (string, error) {
-	retryConfig := retry.KubernetesConfig()
-
-	return retry.DoWithResult(ctx, retryConfig, func() (string, error) {
-		client := GetClient()
+	return retry.KubernetesRetryWithCircuitBreakerResult(ctx, func() (string, error) {
+		client := GetClientset()
 		if client == nil {
 			return "", fmt.Errorf("kubernetes client not initialized")
 		}
@@ -355,9 +1056,7 @@ func (c *DefaultKubernetesClient) GetPodNamesWithContext(ctx context.Context, na
 }
 
 func getClientPodNamesWithContext(ctx context.Context, namespace, labelSelector string) ([]string, error) {
-	retryConfig := retry.KubernetesConfig()
-
-	return retry.DoWithResult(ctx, retryConfig, func() ([]string, error) {
+	return retry.KubernetesRetryWithCircuitBreakerResult(ctx, func() ([]string, error) {
 		cmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", namespace, "-l", labelSelector, "-o", "jsonpath={.items[*].metadata.name}")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
@@ -399,9 +1098,7 @@ func (c *DefaultKubernetesClient) GetPodContainers(namespace, deployment string)
 
 // GetPodContainersWithContext returns all containers for all pods matching the label selector with context
 func GetPodContainersWithContext(ctx context.Context, namespace, labelSelector string) ([]PodContainer, error) {
-	retryConfig := retry.KubernetesConfig()
-
-	return retry.DoWithResult(ctx, retryConfig, func() ([]PodContainer, error) {
+	return retry.KubernetesRetryWithCircuitBreakerResult(ctx, func() ([]PodContainer, error) {
 		if clientset == nil {
 			return nil, fmt.Errorf("kubernetes client not initialized")
 		}
@@ -448,9 +1145,7 @@ func getContainersForPod(namespace, podName string) ([]string, error) {
 
 // GetContainersForPodWithContext returns all containers for a specific pod with context
 func GetContainersForPodWithContext(ctx context.Context, namespace, podName string) ([]string, error) {
-	retryConfig := retry.KubernetesConfig()
-
-	return retry.DoWithResult(ctx, retryConfig, func() ([]string, error) {
+	return retry.KubernetesRetryWithCircuitBreakerResult(ctx, func() ([]string, error) {
 		if clientset == nil {
 			return nil, fmt.Errorf("kubernetes client not initialized")
 		}

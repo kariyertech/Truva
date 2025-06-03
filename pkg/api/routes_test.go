@@ -12,7 +12,8 @@ import (
 func TestInitRoutes(t *testing.T) {
 	// Test that InitRoutes doesn't panic
 	require.NotPanics(t, func() {
-		InitRoutes()
+		mux := http.NewServeMux()
+		InitRoutes(mux)
 	})
 }
 

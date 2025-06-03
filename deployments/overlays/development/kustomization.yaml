@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: truva-dev
+
+resources:
+- ../../base
+
+patchesStrategicMerge:
+- deployment-patch.yaml
+- configmap-patch.yaml
+
+replicas:
+- name: truva
+  count: 1
+
+images:
+- name: truva
+  newTag: dev
+
+commonLabels:
+  environment: development

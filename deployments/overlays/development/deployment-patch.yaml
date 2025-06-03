@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: truva
+spec:
+  template:
+    spec:
+      containers:
+      - name: truva
+        env:
+        - name: TRUVA_ENV
+          value: "development"
+        - name: GIN_MODE
+          value: "debug"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          initialDelaySeconds: 10
+        readinessProbe:
+          initialDelaySeconds: 5

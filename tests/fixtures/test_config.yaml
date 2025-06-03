@@ -1,0 +1,42 @@
+# Test configuration for integration and e2e tests
+server:
+  host: "localhost"
+  port: 8080
+  tls:
+    enabled: false
+
+logging:
+  level: "debug"
+  format: "text"
+  output: "stdout"
+
+log_aggregation:
+  enabled: false
+
+kubernetes:
+  in_cluster: false
+  config_path: ""
+  namespace: "test"
+
+ui:
+  enabled: true
+  path: "/ui"
+  static_path: "./ui/dist"
+
+sync:
+  enabled: true
+  interval: "1s"
+  batch_size: 10
+  timeout: "5s"
+
+monitoring:
+  enabled: true
+  metrics_path: "/metrics"
+  health_path: "/health"
+  ready_path: "/ready"
+
+secrets:
+  encryption_key: "test-32-byte-encryption-key-here!"
+
+rate_limiting:
+  enabled: false

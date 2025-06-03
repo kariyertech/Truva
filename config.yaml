@@ -7,6 +7,16 @@ logging:
   level: "info"
   file: "app.log"
   format: "json"
+
+log_aggregation:
+  enabled: false
+  signoz:
+    enabled: false
+    endpoint: "http://localhost:3301"
+    api_key: "${env:SIGNOZ_API_KEY}"
+    batch_size: 100
+    flush_interval: 5s
+    timeout: 10s
   
 kubernetes:
   config_path: "~/.kube/config"
@@ -21,3 +31,27 @@ sync:
 monitoring:
   metrics_enabled: false
   health_check_enabled: true
+
+secrets:
+  enabled: true
+  store_path: "./secrets.enc"
+  master_password: "${env:TRUVA_SECRETS_MASTER_PASSWORD}"
+  encrypted: true
+  auto_cleanup: true
+  cleanup_interval: 24
+
+rate_limit:
+  enabled: true
+  requests_per_minute: 60
+  burst_size: 10
+  block_duration: 1m
+  whitelist:
+    - "127.0.0.1"
+    - "::1"
+  websocket:
+    enabled: true
+    max_connections: 5
+    connection_timeout: 1h
+    whitelist:
+      - "127.0.0.1"
+      - "::1"
