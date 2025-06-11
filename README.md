@@ -287,8 +287,6 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 
 - **💬 Discussions**: [GitHub Discussions](https://github.com/kariyertech/Truva/discussions)
 - **🐛 Bug Reports**: [GitHub Issues](https://github.com/kariyertech/Truva/issues)
-- **📧 Email**: support@truva.dev
-- **💼 Enterprise**: enterprise@truva.dev
 
 ## 📄 License
 
@@ -306,6 +304,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Made with ❤️ by the Truva Team**
 
-[⭐ Star us on GitHub](https://github.com/kariyertech/Truva) | [🐦 Follow on Twitter](https://twitter.com/truvadev) | [💼 LinkedIn](https://linkedin.com/company/truva)
+[⭐ Star us on GitHub](https://github.com/kariyertech/Truva)
 
 </div>
