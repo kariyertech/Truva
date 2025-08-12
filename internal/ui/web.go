@@ -258,7 +258,12 @@ func StartWebServer(namespace, targetName string) {
 	        http.Error(w, "Failed to create Kubernetes client", http.StatusInternalServerError)
 	        return
 	    }
-	    pods, err := client.GetPodNames(namespace, targetName)
+	    labelSelector, err := k8s.GetDeploymentSelector(namespace, targetName)
+	    if err != nil {
+	        http.Error(w, "Failed to get deployment selector", http.StatusInternalServerError)
+	        return
+	    }
+	    pods, err := client.GetPodNames(namespace, labelSelector)
 	    if err != nil {
 	        http.Error(w, "Failed to get pods", http.StatusInternalServerError)
 	        return
