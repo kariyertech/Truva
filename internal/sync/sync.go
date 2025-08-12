@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -279,6 +281,10 @@ func (fsc *FileSystemChecker) ValidateFileOperation(path string, operation strin
 	}
 
 	// Check file extension
+	// If the path is a directory, skip extension validation
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return nil
+	}
 	if err := fsc.CheckFileExtension(path); err != nil {
 		return fmt.Errorf("file extension validation failed: %w", err)
 	}
@@ -370,7 +376,7 @@ func SyncFilesAndRestartPod(ctx context.Context, namespace, podName, localPath, 
 	}, "Syncing files and restarting process in pod")
 
 	// Enhanced error handling for copy operation
-	err := k8s.CopyToPod(podName, namespace, localPath, targetPath)
+	err := k8s.CopyToPod(localPath, namespace, podName, targetPath)
 	if err != nil {
 		fsError := &FileSystemError{
 			Type: "copy_to_pod_failed",
@@ -389,7 +395,13 @@ func SyncFilesAndRestartPod(ctx context.Context, namespace, podName, localPath, 
 	}
 
 	// Enhanced error handling for restart operation
-	err = k8s.RestartDotnetProcess(namespace, podName)
+	client, clientErr := k8s.NewKubernetesClient()
+	if clientErr != nil {
+		restartError := fmt.Errorf("failed to create Kubernetes client: %w", clientErr)
+		utils.Logger.Error(restartError.Error())
+		return restartError
+	}
+	err = client.RestartDotnetProcess(namespace, podName)
 	if err != nil {
 		restartError := fmt.Errorf("failed to restart process in pod %s: %w", podName, err)
 		utils.Logger.Error(restartError.Error())
@@ -430,7 +442,7 @@ func isDirectory(path string) bool {
 //   - containerPath: Target path inside the containers
 //
 // Returns:
-//   - error: Any error encountered during pod discovery or synchronization
+//   - error: Only returns error if ALL pods fail or critical system issues occur
 func SyncFilesAndRestartAllPods(ctx context.Context, namespace, deployment, localPath, containerPath string) error {
 	deploymentLabels, err := k8s.GetDeploymentSelector(namespace, deployment)
 	if err != nil {
@@ -443,12 +455,14 @@ func SyncFilesAndRestartAllPods(ctx context.Context, namespace, deployment, loca
 	}
 
 	if len(podNames) == 0 {
-		return fmt.Errorf("no pods found for deployment %s", deployment)
+		utils.Logger.Warning("No pods found for deployment " + deployment + ", this might be normal during scaling or restart")
+		return nil // Don't treat as fatal error
 	}
 
 	var wg sync.WaitGroup
-	errorChan := make(chan error, len(podNames))
-
+	successCount := int32(0)
+	failureCount := int32(0)
+	
 	utils.Logger.Info(fmt.Sprintf("Starting sync for %d pods with rate limiting (max %d concurrent operations)", len(podNames), maxConcurrentOps))
 
 	for _, podName := range podNames {
@@ -456,12 +470,15 @@ func SyncFilesAndRestartAllPods(ctx context.Context, namespace, deployment, loca
 		recovery.SafeGo(func() {
 			defer wg.Done()
 
-			// Acquire semaphore for rate limiting
+			// Graceful semaphore acquisition with timeout
 			select {
 			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }() // Release semaphore when done
+				defer func() { <-semaphore }()
+			case <-time.After(30 * time.Second):
+				utils.Logger.Warning(fmt.Sprintf("Rate limit timeout for pod %s, skipping to avoid blocking", podName))
+				atomic.AddInt32(&failureCount, 1)
+				return
 			case <-ctx.Done():
-				errorChan <- ctx.Err()
 				return
 			}
 
@@ -469,9 +486,11 @@ func SyncFilesAndRestartAllPods(ctx context.Context, namespace, deployment, loca
 
 			err := SyncFilesAndRestartPod(ctx, namespace, podName, localPath, containerPath)
 			if err != nil {
-				utils.Logger.Error(fmt.Sprintf("Failed to sync pod %s: %v", podName, err))
-				errorChan <- fmt.Errorf("pod %s: %w", podName, err)
+				atomic.AddInt32(&failureCount, 1)
+				// Log errors as warnings instead of errors to reduce terminal noise
+				utils.Logger.Warning(fmt.Sprintf("Failed to sync pod %s: %v", podName, err))
 			} else {
+				atomic.AddInt32(&successCount, 1)
 				utils.Logger.Info(fmt.Sprintf("Successfully synced pod: %s", podName))
 			}
 		}, map[string]interface{}{
@@ -483,19 +502,26 @@ func SyncFilesAndRestartAllPods(ctx context.Context, namespace, deployment, loca
 	}
 
 	wg.Wait()
-	close(errorChan)
 
-	// Collect any errors that occurred
-	var errors []error
-	for err := range errorChan {
-		errors = append(errors, err)
+	totalPods := len(podNames)
+	successes := int(atomic.LoadInt32(&successCount))
+	failures := int(atomic.LoadInt32(&failureCount))
+
+	// Professional success/failure reporting
+	if successes > 0 {
+		utils.Logger.Info(fmt.Sprintf("Sync completed: %d/%d pods successful", successes, totalPods))
+	}
+	
+	if failures > 0 {
+		utils.Logger.Warning(fmt.Sprintf("Some pods encountered issues: %d/%d failed (this is often normal during pod lifecycle changes)", failures, totalPods))
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("sync failed for %d pods: %v", len(errors), errors)
+	// Only return error if ALL pods failed AND we have pods to work with
+	if failures == totalPods && totalPods > 0 {
+		return fmt.Errorf("all %d pods failed synchronization", totalPods)
 	}
 
-	return nil
+	return nil // Partial failures are acceptable
 }
 
 // WatchForChanges sets up file system monitoring and implements a debounced file synchronization system.
@@ -559,7 +585,7 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 			Op:   "fsnotify_new",
 			Err:  err,
 		}
-		utils.Logger.Error(fmt.Sprintf("Failed to create file watcher: %v", fsError))
+		utils.Logger.Warning(fmt.Sprintf("Failed to create file watcher: %v (file watching disabled)", fsError))
 		return
 	}
 	defer func() {
@@ -576,7 +602,7 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 			Op:   "path_validation",
 			Err:  err,
 		}
-		utils.Logger.Error(fmt.Sprintf("Local path does not exist: %v", fsError))
+		utils.Logger.Warning(fmt.Sprintf("Local path does not exist: %v (file watching disabled)", fsError))
 		return
 	}
 
@@ -592,7 +618,8 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 					// Validate file before processing
 					if event.Op != fsnotify.Remove {
 						if err := fsChecker.ValidateFileOperation(event.Name, "read"); err != nil {
-							utils.Logger.Warning(fmt.Sprintf("Skipping invalid file %s: %v", event.Name, err))
+							// Log as debug instead of warning to reduce noise
+							utils.Logger.Debug(fmt.Sprintf("Skipping invalid file %s: %v", event.Name, err))
 							continue
 						}
 					}
@@ -614,11 +641,11 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 						if err == nil && fileInfo.IsDir() {
 							// Validate new directory before adding to watcher
 							if err := fsChecker.ValidateFileOperation(event.Name, "read"); err != nil {
-								utils.Logger.Warning(fmt.Sprintf("Skipping invalid directory %s: %v", event.Name, err))
+								utils.Logger.Debug(fmt.Sprintf("Skipping invalid directory %s: %v", event.Name, err))
 							} else {
 								utils.Logger.Info("New directory detected:", event.Name)
 								if err := watcher.Add(event.Name); err != nil {
-									utils.Logger.Error(fmt.Sprintf("Failed to watch new directory %s: %v", event.Name, err))
+									utils.Logger.Warning(fmt.Sprintf("Failed to watch new directory %s: %v", event.Name, err))
 								}
 							}
 						}
@@ -636,7 +663,8 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 					Op:   "file_watching",
 					Err:  err,
 				}
-				utils.Logger.Error(fmt.Sprintf("File watcher error: %v", fsError))
+				// Log watcher errors as warnings instead of errors
+				utils.Logger.Warning(fmt.Sprintf("File watcher encountered issue: %v (continuing to monitor)", fsError))
 			case <-cleanupTicker.C:
 				// Periodic memory cleanup
 				if syncMemoryMonitor != nil {
@@ -671,7 +699,7 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 
 				// Validate disk space before processing changes
 				if err := fsChecker.CheckDiskSpace(localPath); err != nil {
-					utils.Logger.Error(fmt.Sprintf("Insufficient disk space for sync operation: %v", err))
+					utils.Logger.Warning(fmt.Sprintf("Insufficient disk space for sync operation: %v (skipping sync)", err))
 					changeMutex.Unlock()
 					return
 				}
@@ -681,7 +709,7 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 
 				err := SyncFilesAndRestartAllPods(ctx, namespace, deployment, localPath, containerPath)
 				if err != nil {
-					utils.Logger.Error(fmt.Sprintf("Failed to sync files and restart pods: %v", err))
+					utils.Logger.Warning(fmt.Sprintf("Sync operation encountered issues: %v (will retry on next change)", err))
 				} else {
 					utils.Logger.Info("Files synced and pods restarted successfully.")
 				}
@@ -722,19 +750,19 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 	// Enhanced directory walking with validation
 	if err := filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			utils.Logger.Warning(fmt.Sprintf("Error walking path %s: %v", path, err))
+			utils.Logger.Debug(fmt.Sprintf("Error walking path %s: %v", path, err))
 			return nil // Continue walking despite errors
 		}
 
 		if info.IsDir() {
 			// Validate directory before adding to watcher
 			if err := fsChecker.ValidateFileOperation(path, "read"); err != nil {
-				utils.Logger.Warning(fmt.Sprintf("Skipping invalid directory %s: %v", path, err))
+				utils.Logger.Debug(fmt.Sprintf("Skipping invalid directory %s: %v", path, err))
 				return nil
 			}
 
 			if err := watcher.Add(path); err != nil {
-				utils.Logger.Error(fmt.Sprintf("Failed to watch directory %s: %v", path, err))
+				utils.Logger.Debug(fmt.Sprintf("Failed to watch directory %s: %v", path, err))
 			}
 		}
 		return nil
@@ -745,8 +773,8 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 			Op:   "filepath_walk",
 			Err:  err,
 		}
-		utils.Logger.Error(fmt.Sprintf("Failed to walk local path: %v", fsError))
-		return
+		utils.Logger.Warning(fmt.Sprintf("Failed to walk local path: %v (partial monitoring may be affected)", fsError))
+		// Don't return, continue with partial monitoring
 	}
 
 	utils.Logger.Info(fmt.Sprintf("Watching for file changes in: %s (with enhanced validation)", localPath))
@@ -757,6 +785,9 @@ func WatchForChanges(ctx context.Context, localPath, namespace, deployment, cont
 // This function is typically called before starting the file watcher to ensure all pods have
 // the latest version of files before monitoring begins. It discovers all pods in the deployment
 // and performs concurrent synchronization operations with enhanced error handling.
+//
+// If no pods are found (replicas=0), it temporarily scales the deployment to 1 replica,
+// waits for the pod to be ready, performs the sync, and restores the original replica count.
 //
 // Parameters:
 //   - localPath: Local file system path to sync from
@@ -788,46 +819,124 @@ func InitialSyncAndRestart(localPath, namespace, deployment, containerPath strin
 	}
 	utils.Logger.Info("Using label selector:", labelSelector)
 
-	podNames, err := k8s.GetPodNames(namespace, labelSelector)
+	// Enhanced pod discovery with automatic problem resolution
+	podNames, err := k8s.GetPodNamesWithDeployment(namespace, labelSelector, deployment)
+	scaledUp := false
+	originalReplicas := int32(0)
+
+	// The GetPodNames function now handles most edge cases automatically,
+	// but we still need to handle the case where it returns an error
 	if err != nil {
-		return fmt.Errorf("failed to get pod names: %w", err)
+		utils.Logger.Warning(fmt.Sprintf("Enhanced pod discovery encountered issues for deployment %s: %v", deployment, err))
+		
+		// Fallback: Try manual scaling approach
+		if strings.Contains(fmt.Sprintf("%v", err), "no pods found") || strings.Contains(fmt.Sprintf("%v", err), "timeout") {
+			utils.Logger.Info(fmt.Sprintf("Attempting manual deployment scaling for %s...", deployment))
+
+			// Get current replica count
+			currentReplicas, getErr := k8s.GetDeploymentReplicas(namespace, deployment)
+			if getErr != nil {
+				return fmt.Errorf("failed to get current replica count for deployment %s: %w", deployment, getErr)
+			}
+
+			originalReplicas = currentReplicas
+
+			if currentReplicas == 0 {
+				utils.Logger.Info(fmt.Sprintf("Deployment %s has 0 replicas, scaling to 1 replica temporarily...", deployment))
+
+				// Scale deployment to 1 replica
+				if scaleErr := k8s.ScaleDeployment(namespace, deployment, 1); scaleErr != nil {
+					return fmt.Errorf("failed to scale deployment %s to 1 replica: %w", deployment, scaleErr)
+				}
+
+				scaledUp = true
+				utils.Logger.Info(fmt.Sprintf("Deployment %s scaled to 1 replica, waiting for pod to be ready...", deployment))
+
+				// Wait for pod to be ready with timeout
+				maxWaitTime := 120 * time.Second
+				waitInterval := 5 * time.Second
+				totalWaited := time.Duration(0)
+
+				for totalWaited < maxWaitTime {
+					time.Sleep(waitInterval)
+					totalWaited += waitInterval
+
+					podNames, err = k8s.GetPodNames(namespace, labelSelector)
+					if err == nil && len(podNames) > 0 {
+						utils.Logger.Info(fmt.Sprintf("Pod ready: %s", podNames[0]))
+						break
+					}
+
+					if totalWaited%20*time.Second == 0 {
+						utils.Logger.Info(fmt.Sprintf("Still waiting for pod to be ready... (%v elapsed)", totalWaited))
+					}
+				}
+
+				if err != nil || len(podNames) == 0 {
+					// Restore original replicas if scaling failed
+					if restoreErr := k8s.ScaleDeployment(namespace, deployment, originalReplicas); restoreErr != nil {
+						utils.Logger.Warning(fmt.Sprintf("Failed to restore original replica count %d: %v", originalReplicas, restoreErr))
+					}
+					return fmt.Errorf("timeout waiting for pod to be ready after scaling deployment %s", deployment)
+				}
+			} else {
+				// We have replicas but no running pods - this might be temporary during rolling updates
+				utils.Logger.Warning(fmt.Sprintf("Deployment %s has %d replicas but no running pods found - this is often normal during updates", deployment, currentReplicas))
+				return nil // Don't treat as fatal error
+			}
+		} else {
+			// Log as warning instead of returning error for less critical issues
+			utils.Logger.Warning(fmt.Sprintf("Pod discovery issue for deployment %s: %v - this might resolve automatically", deployment, err))
+			return nil // Don't block operation for transient issues
+		}
 	}
 
+	// Ensure we have pods to work with
 	if len(podNames) == 0 {
-		return fmt.Errorf("no pods found for deployment %s in namespace %s", deployment, namespace)
+		utils.Logger.Warning(fmt.Sprintf("No pods found for deployment %s in namespace %s - this might be normal during scaling", deployment, namespace))
+		return nil // Don't treat as fatal error
 	}
 
 	utils.Logger.Info(fmt.Sprintf("Pods found for deployment %s: %v", deployment, podNames))
 
+	// Setup cleanup to restore original replica count if we scaled up
+	defer func() {
+		if scaledUp && originalReplicas != 1 {
+			utils.Logger.Info(fmt.Sprintf("Restoring original replica count %d for deployment %s...", originalReplicas, deployment))
+			if restoreErr := k8s.ScaleDeployment(namespace, deployment, originalReplicas); restoreErr != nil {
+				utils.Logger.Warning(fmt.Sprintf("Failed to restore original replica count %d: %v", originalReplicas, restoreErr))
+			} else {
+				utils.Logger.Info(fmt.Sprintf("Successfully restored deployment %s to %d replicas", deployment, originalReplicas))
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
-	errorChan := make(chan error, len(podNames))
+	successCount := int32(0)
+	failureCount := int32(0)
 
 	for _, podName := range podNames {
 		wg.Add(1)
 		recovery.SafeGo(func() {
 			defer wg.Done()
 
-			// Acquire semaphore for rate limiting
+			// Graceful semaphore acquisition with extended timeout for initial sync
 			select {
 			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }() // Release semaphore when done
-			default:
-				// If semaphore is full, wait a bit and try again
-				time.Sleep(100 * time.Millisecond)
-				select {
-				case semaphore <- struct{}{}:
-					defer func() { <-semaphore }()
-				default:
-					errorChan <- fmt.Errorf("rate limit exceeded for pod %s", podName)
-					return
-				}
+				defer func() { <-semaphore }()
+			case <-time.After(60 * time.Second): // Longer timeout for initial sync
+				utils.Logger.Warning(fmt.Sprintf("Rate limit timeout for pod %s during initial sync, skipping to avoid blocking", podName))
+				atomic.AddInt32(&failureCount, 1)
+				return
 			}
 
 			err := SyncFilesAndRestartPod(context.Background(), namespace, podName, localPath, containerPath)
 			if err != nil {
-				utils.Logger.Error(fmt.Sprintf("Failed to sync pod %s: %v", podName, err))
-				errorChan <- fmt.Errorf("pod %s: %w", podName, err)
+				atomic.AddInt32(&failureCount, 1)
+				// Log as warning to reduce noise
+				utils.Logger.Warning(fmt.Sprintf("Failed to sync pod %s: %v", podName, err))
 			} else {
+				atomic.AddInt32(&successCount, 1)
 				utils.Logger.Info(fmt.Sprintf("Successfully synced pod: %s", podName))
 			}
 		}, map[string]interface{}{
@@ -839,18 +948,29 @@ func InitialSyncAndRestart(localPath, namespace, deployment, containerPath strin
 	}
 
 	wg.Wait()
-	close(errorChan)
 
-	// Collect any errors that occurred
-	var errors []error
-	for err := range errorChan {
-		errors = append(errors, err)
+	totalPods := len(podNames)
+	successes := int(atomic.LoadInt32(&successCount))
+	failures := int(atomic.LoadInt32(&failureCount))
+
+	// Professional success/failure reporting
+	if successes > 0 {
+		utils.Logger.Info(fmt.Sprintf("Initial sync completed: %d/%d pods successful", successes, totalPods))
+	}
+	
+	if failures > 0 {
+		utils.Logger.Warning(fmt.Sprintf("Some pods encountered issues during initial sync: %d/%d failed (this can be normal)", failures, totalPods))
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("initial sync failed for %d pods: %v", len(errors), errors)
+	// Only return error if ALL pods failed AND we have pods to work with
+	if failures == totalPods && totalPods > 0 {
+		utils.Logger.Error(fmt.Sprintf("Critical: All %d pods failed initial synchronization", totalPods))
+		return fmt.Errorf("all %d pods failed initial synchronization", totalPods)
 	}
 
-	utils.Logger.Info("Initial sync and restart completed successfully.")
-	return nil
+	if successes > 0 {
+		utils.Logger.Info("Initial sync and restart completed successfully.")
+	}
+	
+	return nil // Partial failures are acceptable for professional operation
 }

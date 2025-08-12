@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "JlBpy3nW3vs=",
+  "success": true,
+  "projectFilePath": "/Users/ahmetcoskunkizilkaya/Desktop/Truva/src/SimpleApp.csproj",
+  "expectedPackageFiles": [
+    "/Users/ahmetcoskunkizilkaya/.nuget/packages/microsoft.netcore.app.ref/6.0.33/microsoft.netcore.app.ref.6.0.33.nupkg.sha512",
+    "/Users/ahmetcoskunkizilkaya/.nuget/packages/microsoft.aspnetcore.app.ref/6.0.33/microsoft.aspnetcore.app.ref.6.0.33.nupkg.sha512",
+    "/Users/ahmetcoskunkizilkaya/.nuget/packages/microsoft.netcore.app.host.osx-arm64/6.0.33/microsoft.netcore.app.host.osx-arm64.6.0.33.nupkg.sha512"
+  ],
+  "logs": []
+}

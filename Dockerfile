@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for Truva Kubernetes Development Tool
 # Stage 1: Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 # Install security updates and required packages
 RUN apk update && apk add --no-cache \

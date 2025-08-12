@@ -458,7 +458,8 @@ Examples:
 			err := syncer.InitialSyncAndRestart(localPath, namespace, targetName, containerPath)
 			if err != nil {
 				RecordSyncOperation("start_sync", "error", time.Since(syncStart))
-				errors.Handle(errors.Wrap(err, errors.LevelError, "SYNC_ERROR", "Failed to start sync").WithContext("target", targetName))
+				// Log as warning instead of error to reduce terminal noise
+				errors.Warning("SYNC_WARNING", fmt.Sprintf("Initial sync encountered issues: %v (system will continue to operate)", err))
 				return
 			}
 			RecordSyncOperation("start_sync", "success", time.Since(syncStart))
@@ -470,6 +471,12 @@ Examples:
 			"local_path":     localPath,
 			"container_path": containerPath,
 		})
+
+		// Wait a moment for the server to start
+		time.Sleep(2 * time.Second)
+
+		// Open browser after starting web server
+		openBrowser("http://localhost:8080")
 
 		// Start monitoring server
 		monitoringServer := &http.Server{

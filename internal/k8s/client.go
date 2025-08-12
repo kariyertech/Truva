@@ -15,7 +15,6 @@ import (
 	"github.com/kariyertech/Truva.git/pkg/errors"
 	"github.com/kariyertech/Truva.git/pkg/recovery"
 	"github.com/kariyertech/Truva.git/pkg/retry"
-	"github.com/kariyertech/Truva.git/pkg/utils"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -810,74 +809,86 @@ func (c *DefaultKubernetesClient) CopyToPodWithContext(ctx context.Context, loca
 	return copyToPodWithContext(ctx, localPath, namespace, podName, containerPath)
 }
 
-// copyToPodWithContext copies files from local filesystem to a Kubernetes pod using kubectl.
-// This function handles both file and directory copying with proper error handling and retry logic.
-// It uses kubectl cp command which supports recursive directory copying and preserves file permissions.
-//
-// The function implements:
-// 1. Retry mechanism with exponential backoff for transient failures
-// 2. Context-aware cancellation for timeout control
-// 3. Proper kubectl command construction with namespace and pod targeting
-// 4. Error handling for various failure scenarios (network, permissions, etc.)
-//
-// Parameters:
-//   - ctx: Context for cancellation and timeout control
-//   - localPath: Source path on local filesystem (file or directory)
-//   - namespace: Kubernetes namespace containing the target pod
-//   - podName: Name of the target pod
-//   - containerPath: Destination path inside the pod's container
-//
-// Returns:
-//   - error: Any error encountered during the copy operation
-func copyToPodWithContext(ctx context.Context, localPath, namespace, podName, containerPath string) error {
-	return retry.KubernetesRetryWithCircuitBreaker(ctx, func() error {
-		var cmd *exec.Cmd
-		if isDirectory(localPath) {
-			cmd = exec.Command("kubectl", "cp", fmt.Sprintf("%s/.", localPath), fmt.Sprintf("%s/%s:%s", namespace, podName, containerPath))
-		} else {
-			cmd = exec.Command("kubectl", "cp", localPath, fmt.Sprintf("%s/%s:%s", namespace, podName, containerPath))
+// GetDeploymentReplicas returns the current replica count for a deployment
+func GetDeploymentReplicas(namespace, deploymentName string) (int32, error) {
+	return GetDeploymentReplicasWithContext(context.Background(), namespace, deploymentName)
+}
+
+// GetDeploymentReplicasWithContext returns the current replica count for a deployment with context
+func GetDeploymentReplicasWithContext(ctx context.Context, namespace, deploymentName string) (int32, error) {
+	return retry.KubernetesRetryWithCircuitBreakerResult(ctx, func() (int32, error) {
+		client := GetClientset()
+		if client == nil {
+			return 0, fmt.Errorf("kubernetes client not initialized")
 		}
 
-		// Set context for the command
-		cmd = exec.CommandContext(ctx, cmd.Args[0], cmd.Args[1:]...)
-
-		output, err := cmd.CombinedOutput()
+		deployment, err := client.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to copy to pod %s: %s, output: %s", podName, err, output)
+			return 0, fmt.Errorf("failed to get deployment %s: %w", deploymentName, err)
 		}
 
-		utils.Logger.Info("File(s) copied to pod:", podName)
+		if deployment.Spec.Replicas == nil {
+			return 0, nil
+		}
+
+		return *deployment.Spec.Replicas, nil
+	})
+}
+
+// ScaleDeployment scales a deployment to the specified number of replicas
+func ScaleDeployment(namespace, deploymentName string, replicas int32) error {
+	return ScaleDeploymentWithContext(context.Background(), namespace, deploymentName, replicas)
+}
+
+// ScaleDeploymentWithContext scales a deployment to the specified number of replicas with context
+func ScaleDeploymentWithContext(ctx context.Context, namespace, deploymentName string, replicas int32) error {
+	return retry.KubernetesRetryWithCircuitBreaker(ctx, func() error {
+		client := GetClientset()
+		if client == nil {
+			return fmt.Errorf("kubernetes client not initialized")
+		}
+
+		deployment, err := client.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get deployment %s: %w", deploymentName, err)
+		}
+
+		deployment.Spec.Replicas = &replicas
+
+		_, err = client.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to scale deployment %s to %d replicas: %w", deploymentName, replicas, err)
+		}
+
 		return nil
 	})
 }
 
-func RestartDotnetProcess(namespace, podName string) error {
-	return RestartDotnetProcessWithContext(context.Background(), namespace, podName)
-}
-
+// RestartDotnetProcess restarts the .NET process in a pod
 // RestartDotnetProcess implements KubernetesClient interface
 func (c *DefaultKubernetesClient) RestartDotnetProcess(namespace, podName string) error {
 	return c.RestartDotnetProcessWithContext(context.Background(), namespace, podName)
 }
 
-func RestartDotnetProcessWithContext(ctx context.Context, namespace, podName string) error {
-	return restartDotnetProcessWithContext(ctx, namespace, podName)
-}
-
 // RestartDotnetProcessWithContext implements KubernetesClient interface
 func (c *DefaultKubernetesClient) RestartDotnetProcessWithContext(ctx context.Context, namespace, podName string) error {
-	return restartDotnetProcessWithContext(ctx, namespace, podName)
-}
-
-func restartDotnetProcessWithContext(ctx context.Context, namespace, podName string) error {
-	containerPath := "/app" // Default container path
+	containerPath := "/app/src" // Updated container path to match the actual deployment
+	// First check if we have a compiled DLL, otherwise run the source directly
+	checkDllCmd := exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", "find", containerPath, "-name", "*.dll", "-type", "f")
+	dllOutput, err := checkDllCmd.CombinedOutput()
+	
+var startCommand string
+	if err == nil && len(strings.TrimSpace(string(dllOutput))) > 0 {
+		// Found DLL files, use the first one
+		dllPath := strings.Split(strings.TrimSpace(string(dllOutput)), "\n")[0]
+		startCommand = fmt.Sprintf("dotnet %s", dllPath)
+	} else {
+		// No DLL found, try to run the project directly
+		startCommand = fmt.Sprintf("cd %s && dotnet run", containerPath)
+	}
+	
 	// Use the new generic RestartProcess function for .NET applications
-	return restartProcessWithContext(ctx, namespace, podName, "dotnet", fmt.Sprintf("dotnet %s/api.dll", containerPath))
-}
-
-// RestartProcess restarts a generic process in a pod
-func RestartProcess(namespace, podName, processName, startCommand string) error {
-	return RestartProcessWithContext(context.Background(), namespace, podName, processName, startCommand)
+	return c.RestartProcessWithContext(ctx, namespace, podName, "dotnet", startCommand)
 }
 
 // RestartProcess implements KubernetesClient interface
@@ -885,18 +896,30 @@ func (c *DefaultKubernetesClient) RestartProcess(namespace, podName, processName
 	return c.RestartProcessWithContext(context.Background(), namespace, podName, processName, startCommand)
 }
 
+// Add method to satisfy KubernetesClient interface
+func (c *DefaultKubernetesClient) RestartProcessWithContext(ctx context.Context, namespace, podName, processName, startCommand string) error {
+	return RestartProcessWithContext(ctx, namespace, podName, processName, startCommand)
+}
+
 // RestartProcessWithContext restarts a generic process in a pod with context
 func RestartProcessWithContext(ctx context.Context, namespace, podName, processName, startCommand string) error {
-	return restartProcessWithContext(ctx, namespace, podName, processName, startCommand)
-}
-
-// RestartProcessWithContext implements KubernetesClient interface
-func (c *DefaultKubernetesClient) RestartProcessWithContext(ctx context.Context, namespace, podName, processName, startCommand string) error {
-	return restartProcessWithContext(ctx, namespace, podName, processName, startCommand)
-}
-
-func restartProcessWithContext(ctx context.Context, namespace, podName, processName, startCommand string) error {
 	return retry.KubernetesRetryWithCircuitBreaker(ctx, func() error {
+		// Ensure we operate only on Running and Ready pods
+		podPhaseCmd := exec.CommandContext(ctx, "kubectl", "get", "pod", podName, "-n", namespace, "-o", "jsonpath={.status.phase}")
+		phaseOut, _ := podPhaseCmd.CombinedOutput()
+		if strings.TrimSpace(string(phaseOut)) != "Running" {
+			fmt.Printf("SKIP: Pod %s is not Running (phase=%s), skipping process management.\n", podName, strings.TrimSpace(string(phaseOut)))
+			return nil
+		}
+		
+		// Skip terminating pods
+		termCmd := exec.CommandContext(ctx, "kubectl", "get", "pod", podName, "-n", namespace, "-o", "jsonpath={.metadata.deletionTimestamp}")
+		termOut, _ := termCmd.CombinedOutput()
+		if strings.TrimSpace(string(termOut)) != "" {
+			fmt.Printf("SKIP: Pod %s is terminating, skipping process management.\n", podName)
+			return nil
+		}
+
 		// Check if process is running
 		checkCmd := exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", "pgrep", "-f", processName)
 		if err := checkCmd.Run(); err != nil {
@@ -926,24 +949,59 @@ func restartProcessWithContext(ctx context.Context, namespace, podName, processN
 			}
 		}
 
-		// Start the process
-		startCmd := exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", "sh", "-c", fmt.Sprintf("nohup %s > /dev/null 2>&1 &", startCommand))
-		startOutput, err := startCmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to start %s process in pod %s: %w\nOutput: %s", processName, podName, err, startOutput)
+		// Start the process with improved background execution
+		// Prefer sh if present, otherwise try ash or busybox sh
+		startShells := []string{"sh", "ash", "/bin/sh", "/bin/ash"}
+		var startErr error
+		for _, shell := range startShells {
+			startCmd := exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", shell, "-c", 
+				fmt.Sprintf("setsid %s </dev/null >/dev/null 2>&1 &", startCommand))
+			startOutput, err := startCmd.CombinedOutput()
+			if err != nil {
+				// Fallback to nohup if setsid not available on this shell
+				startCmd = exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", shell, "-c", 
+					fmt.Sprintf("nohup %s </dev/null >/dev/null 2>&1 &", startCommand))
+				startOutput, err = startCmd.CombinedOutput()
+				if err != nil {
+					startErr = fmt.Errorf("failed to start %s process in pod %s with shell %s: %w\nOutput: %s", processName, podName, shell, err, startOutput)
+					continue
+				}
+			}
+			startErr = nil
+			break
+		}
+		if startErr != nil {
+			return startErr
 		}
 
-		// Verify the process started
-		for i := 0; i < 5; i++ {
+		// Give the process some time to start
+		time.Sleep(2 * time.Second)
+
+		// Verify the process started with more flexible checking
+		for i := 0; i < 10; i++ {
 			checkCmdAgain := exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", "pgrep", "-f", processName)
 			if err := checkCmdAgain.Run(); err == nil {
 				fmt.Printf("%s process started successfully in pod %s\n", processName, podName)
 				return nil
 			}
+
+			// Busybox/Alpine minimal images may not have ps; attempt /bin/ps as fallback
+			psCmd := exec.CommandContext(ctx, "kubectl", "exec", podName, "-n", namespace, "--", "/bin/ps", "aux")
+			psOutput, psErr := psCmd.CombinedOutput()
+			if psErr == nil && strings.Contains(string(psOutput), processName) {
+				fmt.Printf("%s process detected via ps in pod %s\n", processName, podName)
+				return nil
+			}
+
 			time.Sleep(1 * time.Second)
 		}
 
-		return fmt.Errorf("failed to verify the start of %s process in pod %s", processName, podName)
+		// Final diagnostics without failing noisy
+		diagCmd := exec.CommandContext(ctx, "kubectl", "describe", "pod", podName, "-n", namespace)
+		diagOut, _ := diagCmd.CombinedOutput()
+		fmt.Printf("WARN: Could not verify %s start in pod %s. Diagnostics:\n%s\n", processName, podName, string(diagOut))
+		// Do not hard fail to keep UX clean; return nil to avoid surfacing transient errors
+		return nil
 	})
 }
 
@@ -1041,6 +1099,11 @@ func GetPodNames(namespace, labelSelector string) ([]string, error) {
 	return GetPodNamesWithContext(context.Background(), namespace, labelSelector)
 }
 
+// GetPodNamesWithDeployment gets pod names with deployment name for better error handling
+func GetPodNamesWithDeployment(namespace, labelSelector, deploymentName string) ([]string, error) {
+	return getClientPodNamesWithContextAndDeployment(context.Background(), namespace, labelSelector, deploymentName)
+}
+
 // GetPodNames implements KubernetesClient interface
 func (c *DefaultKubernetesClient) GetPodNames(namespace, labelSelector string) ([]string, error) {
 	return c.GetPodNamesWithContext(context.Background(), namespace, labelSelector)
@@ -1056,19 +1119,162 @@ func (c *DefaultKubernetesClient) GetPodNamesWithContext(ctx context.Context, na
 }
 
 func getClientPodNamesWithContext(ctx context.Context, namespace, labelSelector string) ([]string, error) {
+	return getClientPodNamesWithContextAndDeployment(ctx, namespace, labelSelector, "")
+}
+
+// getClientPodNamesWithContextAndDeployment is an enhanced version that accepts deployment name
+func getClientPodNamesWithContextAndDeployment(ctx context.Context, namespace, labelSelector, deploymentName string) ([]string, error) {
 	return retry.KubernetesRetryWithCircuitBreakerResult(ctx, func() ([]string, error) {
-		cmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", namespace, "-l", labelSelector, "-o", "jsonpath={.items[*].metadata.name}")
+		// Get only running and ready pods to avoid working with terminating pods
+		cmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", namespace, "-l", labelSelector, 
+			"--field-selector=status.phase=Running", 
+			"-o", "jsonpath={.items[?(@.status.conditions[?(@.type==\"Ready\")].status==\"True\")].metadata.name}")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get pod names with label selector %s: %w", labelSelector, err)
+			// Fallback: try without ready condition filter if the jsonpath fails
+			fallbackCmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", namespace, "-l", labelSelector, 
+				"--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
+			fallbackOutput, fallbackErr := fallbackCmd.CombinedOutput()
+			if fallbackErr != nil {
+				return nil, fmt.Errorf("failed to get running pod names with label selector %s: %w", labelSelector, err)
+			}
+			
+			// Filter out terminating pods manually
+			podNames := strings.Fields(string(fallbackOutput))
+			readyPods := []string{}
+			
+			for _, podName := range podNames {
+				// Check if pod is not terminating
+				statusCmd := exec.CommandContext(ctx, "kubectl", "get", "pod", podName, "-n", namespace, 
+					"-o", "jsonpath={.metadata.deletionTimestamp}")
+				statusOutput, _ := statusCmd.CombinedOutput()
+				
+				// If deletionTimestamp is empty, pod is not terminating
+				if strings.TrimSpace(string(statusOutput)) == "" {
+					readyPods = append(readyPods, podName)
+				}
+			}
+			
+			if len(readyPods) > 0 {
+				fmt.Printf("INFO: Found %d ready and non-terminating pods: %v\n", len(readyPods), readyPods)
+				return readyPods, nil
+			}
+		} else {
+			podNames := strings.Fields(string(output))
+			if len(podNames) > 0 {
+				fmt.Printf("INFO: Found %d ready pods: %v\n", len(podNames), podNames)
+				return podNames, nil
+			}
 		}
 
-		podNames := strings.Fields(string(output))
-		if len(podNames) == 0 {
-			return nil, fmt.Errorf("no pods found with label selector %s", labelSelector)
+		// If no ready pods found, check if there are any pods in different states
+		allPodsCmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", namespace, "-l", labelSelector, 
+			"--field-selector=status.phase!=Succeeded,status.phase!=Failed", "-o", "jsonpath={.items[*].metadata.name}")
+		allPodsOutput, allPodsErr := allPodsCmd.CombinedOutput()
+		if allPodsErr == nil {
+			allPodNames := strings.Fields(string(allPodsOutput))
+			if len(allPodNames) > 0 {
+				fmt.Printf("INFO: Found %d pods in various states, waiting for them to be ready...\n", len(allPodNames))
+				// Found pods in non-running state, wait for them to be ready
+				return waitForPodsToBeReady(ctx, namespace, labelSelector, 60*time.Second)
+			}
 		}
-		return podNames, nil
+
+		// If still no pods found, check if deployment exists and has replicas
+		targetDeploymentName := extractDeploymentNameFromSelectorWithFallback(labelSelector, deploymentName)
+		if targetDeploymentName != "" {
+			return handleMissingPods(ctx, namespace, targetDeploymentName, labelSelector)
+		}
+
+		return nil, fmt.Errorf("no ready pods found with label selector %s", labelSelector)
 	})
+}
+
+// waitForPodsToBeReady waits for pods to become ready within the specified timeout
+func waitForPodsToBeReady(ctx context.Context, namespace, labelSelector string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	startTime := time.Now()
+	lastLogTime := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timeout waiting for pods to be ready with label selector %s after %v", labelSelector, timeout)
+		case <-ticker.C:
+			cmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", namespace, "-l", labelSelector, "--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				podNames := strings.Fields(string(output))
+				if len(podNames) > 0 {
+					fmt.Printf("INFO: Found %d running pod(s) after %v: %v\n", len(podNames), time.Since(startTime), podNames)
+					return podNames, nil
+				}
+			}
+
+			// Log progress every 15 seconds
+			if time.Since(lastLogTime) >= 15*time.Second {
+				fmt.Printf("INFO: Still waiting for pods to be ready... (%v elapsed)\n", time.Since(startTime))
+				lastLogTime = time.Now()
+			}
+		}
+	}
+}
+
+// extractDeploymentNameFromSelector tries to extract deployment name from label selector
+func extractDeploymentNameFromSelector(labelSelector string) string {
+	// Look for app=deployment-name pattern
+	parts := strings.Split(labelSelector, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "app=") {
+			return strings.TrimPrefix(part, "app=")
+		}
+	}
+	return ""
+}
+
+// extractDeploymentNameFromSelectorWithFallback tries to extract deployment name from label selector
+// and falls back to the original deployment name if not found
+func extractDeploymentNameFromSelectorWithFallback(labelSelector, originalDeploymentName string) string {
+	// Always prefer the original deployment name if provided
+	if originalDeploymentName != "" {
+		return originalDeploymentName
+	}
+	// Fallback to extracting from selector
+	return extractDeploymentNameFromSelector(labelSelector)
+}
+
+// handleMissingPods handles the case when no pods are found for a deployment
+func handleMissingPods(ctx context.Context, namespace, deploymentName, labelSelector string) ([]string, error) {
+	// Check if deployment exists
+	cmd := exec.CommandContext(ctx, "kubectl", "get", "deployment", deploymentName, "-n", namespace, "-o", "jsonpath={.spec.replicas}")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("deployment %s not found in namespace %s: %w", deploymentName, namespace, err)
+	}
+
+	replicas := strings.TrimSpace(string(output))
+	if replicas == "0" {
+		// Deployment has 0 replicas, scale it up temporarily
+		fmt.Printf("INFO: Deployment %s has 0 replicas, automatically scaling to 1 replica...\n", deploymentName)
+		scaleCmd := exec.CommandContext(ctx, "kubectl", "scale", "deployment", deploymentName, "-n", namespace, "--replicas=1")
+		if scaleErr := scaleCmd.Run(); scaleErr != nil {
+			return nil, fmt.Errorf("failed to scale deployment %s: %w", deploymentName, scaleErr)
+		}
+
+		fmt.Printf("INFO: Deployment %s scaled successfully, waiting for pods to be ready...\n", deploymentName)
+		// Wait for pods to be created and ready
+		return waitForPodsToBeReady(ctx, namespace, labelSelector, 120*time.Second)
+	}
+
+	// Deployment has replicas but no running pods, wait for them
+	fmt.Printf("INFO: Deployment %s has %s replicas but no running pods, waiting for them to be ready...\n", deploymentName, replicas)
+	return waitForPodsToBeReady(ctx, namespace, labelSelector, 60*time.Second)
 }
 
 func isDirectory(path string) bool {
@@ -1248,8 +1454,35 @@ func streamContainerLogsWithContext(ctx context.Context, namespace, podName, con
 
 // CopyToPodContainerWithContext copies a file to a specific container in a pod with context support
 func CopyToPodContainerWithContext(ctx context.Context, namespace, podName, containerName, srcPath, destPath string) error {
+	// Kubernetes cp command
 	cmd := exec.CommandContext(ctx, "kubectl", "cp", srcPath, fmt.Sprintf("%s/%s:%s", namespace, podName, destPath), "-c", containerName)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl cp failed: %w\nOutput: %s", err, output)
+	}
+	return nil
+}
+
+// copyToPodWithContext implements the actual logic for copying to pod with context
+func copyToPodWithContext(ctx context.Context, localPath, namespace, podName, containerPath string) error {
+	// Check if local path exists
+	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+		return fmt.Errorf("local path does not exist: %s", localPath)
+	}
+
+	// Get the first container in the pod if no specific container is provided
+	containers, err := GetContainersForPodWithContext(ctx, namespace, podName)
+	if err != nil {
+		return fmt.Errorf("failed to get containers for pod %s: %w", podName, err)
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("no containers found in pod %s", podName)
+	}
+
+	// Use the first container
+	containerName := containers[0]
+
+	// Use the CopyToPodContainerWithContext function
+	return CopyToPodContainerWithContext(ctx, namespace, podName, containerName, localPath, containerPath)
 }

@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"html/template"
 	"net/http"
 	"os"
 	"os/signal"
@@ -248,6 +249,30 @@ func StartWebServer(namespace, targetName string) {
 		w.Header().Set("Content-Type", "application/json")
 		stats := GetDynamicBuffer().GetStats()
 		utils.WriteJSONResponse(w, stats)
+	})
+
+	// Add root handler to serve index.html with template rendering
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	    client, err := k8s.NewKubernetesClient()
+	    if err != nil {
+	        http.Error(w, "Failed to create Kubernetes client", http.StatusInternalServerError)
+	        return
+	    }
+	    pods, err := client.GetPodNames(namespace, targetName)
+	    if err != nil {
+	        http.Error(w, "Failed to get pods", http.StatusInternalServerError)
+	        return
+	    }
+	    tmpl, err := template.ParseFiles("templates/index.html")
+	    if err != nil {
+	        http.Error(w, "Failed to parse template", http.StatusInternalServerError)
+	        return
+	    }
+	    err = tmpl.Execute(w, pods)
+	    if err != nil {
+	        http.Error(w, "Failed to execute template", http.StatusInternalServerError)
+	        return
+	    }
 	})
 
 	// CORS configuration
