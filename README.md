@@ -19,6 +19,8 @@
 
 ## 🚀 Overview
 
+![](./image.png)
+
 Truva is a powerful, enterprise-grade CLI tool and web platform designed for modern Kubernetes development workflows. It provides seamless file synchronization, intelligent process management, and real-time monitoring capabilities that enhance developer productivity and operational visibility.
 
 ### 🎯 Why Truva?

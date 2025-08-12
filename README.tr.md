@@ -19,6 +19,8 @@
 
 ## 🚀 Genel Bakış
 
+![](./image.png)
+
 Truva, modern Kubernetes geliştirme iş akışları için tasarlanmış güçlü, kurumsal düzeyde bir CLI aracı ve web platformudur. Geliştirici verimliliğini ve operasyonel görünürlüğü artıran sorunsuz dosya senkronizasyonu, akıllı süreç yönetimi ve gerçek zamanlı izleme yetenekleri sağlar.
 
 ### 🎯 Neden Truva?
