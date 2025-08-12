@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -499,8 +501,15 @@ func streamLogsOptimized(ctx context.Context, conn *websocket.Conn, namespace, d
 		return
 	}
 
+	// Get deployment selector
+	labelSelector, err := k8s.GetDeploymentSelector(namespace, deployment)
+	if err != nil {
+		utils.Logger.Error(fmt.Sprintf("Failed to get deployment selector: %v", err))
+		return
+	}
+
 	// Get pods for the deployment
-	pods, err := client.GetPodNames(namespace, deployment)
+	pods, err := client.GetPodNames(namespace, labelSelector)
 	if err != nil {
 		utils.Logger.Error(fmt.Sprintf("Failed to get pods: %v", err))
 		return
@@ -513,11 +522,26 @@ func streamLogsOptimized(ctx context.Context, conn *websocket.Conn, namespace, d
 	// Stream logs from all pods
 	for _, pod := range pods {
 		go func(podName string) {
-			err := client.StreamPodLogsWithContext(ctx, namespace, podName, conn.UnderlyingConn())
-			if err != nil {
-				utils.Logger.Error(fmt.Sprintf("Failed to stream logs from pod %s: %v", podName, err))
+			pr, pw := io.Pipe()
+			go func() {
+				defer pw.Close()
+				err := client.StreamPodLogsWithContext(ctx, namespace, podName, pw)
+				if err != nil {
+					utils.Logger.Error(fmt.Sprintf("Failed to stream logs from pod %s: %v", podName, err))
+				}
+			}()
+
+			scanner := bufio.NewScanner(pr)
+			for scanner.Scan() {
+				logLine := scanner.Bytes()
+				formattedLog := fmt.Sprintf("[%s] %s", podName, string(logLine))
+				logChan <- []byte(formattedLog)
 			}
-		}(pod)
+
+			if err := scanner.Err(); err != nil {
+				utils.Logger.Error(fmt.Sprintf("Error reading logs from pod %s: %v", podName, err))
+			}
+		} (pod)
 	}
 
 	// Handle log rotation and memory pressure
